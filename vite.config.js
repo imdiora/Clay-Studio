@@ -10,6 +10,26 @@ export default defineConfig({
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'credentialless',
     },
+    proxy: {
+      '/gemini-proxy': {
+        target: 'https://generativelanguage.googleapis.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/gemini-proxy/, ''),
+        secure: true,
+      },
+      '/kie-proxy': {
+        target: 'https://api.kie.ai',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/kie-proxy/, ''),
+        secure: true,
+      },
+      '/openai-proxy': {
+        target: 'https://api.openai.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/openai-proxy/, ''),
+        secure: true,
+      },
+    },
   },
   preview: {
     headers: {

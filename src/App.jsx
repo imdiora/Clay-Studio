@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+﻿import React, { useState, useEffect, useCallback, useRef } from 'react';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
@@ -94,7 +94,12 @@ const removeKlingNegativeTerms = (prompt) => prompt
 const IMAGE_MODEL_CONFIGS = {
     nanoBanana2: {
         label: 'NanoBanana 2',
-        modelId: 'gemini-3.1-flash-image-preview',
+        modelId: 'gemini-2.5-flash-image-preview',
+        candidateModelIds: [
+            'gemini-2.5-flash-image-preview',
+            'gemini-2.5-flash-image',
+            'gemini-2.0-flash-preview-image-generation'
+        ],
         quality: 'standard',
         steps: 'minimum',
         upscale: false,
@@ -108,6 +113,11 @@ const IMAGE_MODEL_CONFIGS = {
     nanoBananaPro: {
         label: 'NanoBanana Pro',
         modelId: 'gemini-3-pro-image-preview',
+        candidateModelIds: [
+            'gemini-3-pro-image-preview',
+            'gemini-3-pro-image',
+            'gemini-2.5-flash-image-preview'
+        ],
         quality: 'high',
         steps: 'standard',
         upscale: true,
@@ -184,6 +194,11 @@ const transformVideoPrompt = (originalPrompt, selectedModel) => {
         ? removeKlingNegativeTerms(originalPrompt || '')
         : (originalPrompt || '').trim();
 
+    prompt = prompt
+        .replace(/\b(non[-\s]?disney|disney|pixar|dreamworks|marvel|dc comics|star wars|pokemon|mickey|simba|lion king)\b[.,;:]?/gi, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+
     if (tier === 'lite') {
         prompt = prompt
             .replace(/\bcamera follows\b[.,;:]?/gi, '')
@@ -211,6 +226,21 @@ const migrateVideoEngine = (stored) => {
 };
 
 const USER_CANCELLED_REQUEST = 'Request cancelled by user';
+
+const VOICE_CONFIG = [
+    { id: 'echo', name: 'Echo', style: 'Neutral & Steady', emoji: '🔊', sampleUrl: '/samples/echo.mp3' },
+    { id: 'onyx', name: 'Onyx', style: 'Deep & Cinematic', emoji: '🎙️', sampleUrl: '/samples/onyx.mp3' },
+    { id: 'nova', name: 'Nova', style: 'Bright & Energetic', emoji: '⚡', sampleUrl: '/samples/nova.mp3' }
+];
+
+const normalizeVoiceId = (voiceId) => (
+    VOICE_CONFIG.some(voice => voice.id === voiceId) ? voiceId : VOICE_CONFIG[0].id
+);
+
+const VIBE_OPTIONS = ['Neutral', 'Dramatic', 'Optimistic', 'Whisper', 'Authoritative'];
+
+// Production credits: 10 pts per image, 50 pts per video, 5 pts per voiceover
+const PTS_COST = { image: 10, video: 50, voiceover: 5 };
 
 const WIZARD_STEPS = ['Story', 'Scene Breakdown', 'Images', 'Animate', 'Voiceover'];
 
@@ -279,6 +309,18 @@ export default function App() {
     const activeImageGenTimersRef = useRef(new Map());
     const imageAbortControllersRef = useRef(new Map());
     const videoAbortControllersRef = useRef(new Map());
+    const videoPollingIntervalsRef = useRef(new Map());
+    const audioAbortControllersRef = useRef(new Map());
+    const sampleAudioRef = useRef(null);
+    const [playingVoiceSample, setPlayingVoiceSample] = useState('');
+
+    // Asset Tray state (Start/End Frame assignment for each scene)
+    const [assetTrayOpen, setAssetTrayOpen] = useState(false);
+    const [assetTraySceneIndex, setAssetTraySceneIndex] = useState(0);
+    const [assetTraySlot, setAssetTraySlot] = useState('start'); // 'start' | 'end'
+
+    // Voiceover step selected scene (separate from animate selectedSceneIndex)
+    const [voiceoverSceneIndex, setVoiceoverSceneIndex] = useState(0);
 
     const addLog = useCallback((type, message) => {
         const timestamp = new Date();
@@ -333,6 +375,10 @@ export default function App() {
         return () => {
             if (finalVideoUrl) {
                 URL.revokeObjectURL(finalVideoUrl);
+            }
+            if (sampleAudioRef.current) {
+                sampleAudioRef.current.pause();
+                sampleAudioRef.current = null;
             }
         };
     }, [finalVideoUrl]);
@@ -618,7 +664,7 @@ Guidelines:
                     
                     geminiParts.push({ text: `${systemPrompt}\n\n${userPrompt}` });
 
-                    response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${geminiKey}`, {
+                    response = await fetch(`/gemini-proxy/v1beta/models/gemini-1.5-pro:generateContent?key=${geminiKey}`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json'
@@ -662,8 +708,17 @@ Guidelines:
                 const scenesWithImages = parsed.scenes.map(scene => ({
                     ...scene,
                     dialogue: scene.dialogue || '',
+                    narratorScript: scene.dialogue || scene.text || '',
+                    audioUrl: null,
+                    audioFileName: '',
+                    audioSource: '',
+                    isGeneratingAudio: false,
+                    voiceId: VOICE_CONFIG[0].id,
+                    voiceVibe: 'Neutral',
                     imagePrompt: buildImagePromptForScene(scene),
                     generatedImage: null,
+                    startFrame: null,
+                    endFrame: null,
                     isGenerating: false,
                     error: null,
                     videoPrompt: generateVideoPrompt({ ...scene, dialogue: scene.dialogue || '' }),
@@ -671,8 +726,9 @@ Guidelines:
                     videoUrl: null,
                     videoTaskId: null,
                     videoProgress: 0,
-                    videoStatus: 'pending', // pending, generating, completed, failed
-                    isGeneratingVideo: false
+                    videoStatus: 'pending',
+                    isGeneratingVideo: false,
+                    videoEngine: null
                 }));
                 
                 setScenes(scenesWithImages);
@@ -830,6 +886,7 @@ Guidelines:
         try {
             const startedAt = performance.now();
             const modelId = imageModelConfig.modelId;
+            const candidateModelIds = [...new Set(imageModelConfig.candidateModelIds || [modelId])];
             const timeoutMs = imageModelConfig.timeoutMs;
             const buildImageParts = (useSimplifiedPrompt = false) => {
                 const promptText = useSimplifiedPrompt
@@ -857,13 +914,13 @@ Guidelines:
                 return parts;
             };
 
-            const requestNanoBananaImage = async (imageParts, requestTimeoutMs, attemptLabel) => {
+            const requestNanoBananaImage = async (imageParts, requestTimeoutMs, attemptLabel, candidateModelId = modelId) => {
                 const promptText = imageParts[imageParts.length - 1]?.text || scene.frameDescription;
-                const timerLabel = `[Image API] Scene ${sceneIndex + 1} ${imageModelConfig.label} ${attemptLabel}`;
-                addLog('API_CALL', `Requesting Scene ${sceneIndex + 1} image from ${imageModelConfig.label} (${modelId}) [${attemptLabel}]. Quality=${imageModelConfig.quality}, Steps=${imageModelConfig.steps}, Upscale=${imageModelConfig.upscale}. Timeout=${Math.round(requestTimeoutMs / 1000)}s. Prompt: ${promptText}`);
+                const timerLabel = `[Image API] Scene ${sceneIndex + 1} ${imageModelConfig.label} ${attemptLabel} ${candidateModelId}`;
+                addLog('API_CALL', `Requesting Scene ${sceneIndex + 1} image from ${imageModelConfig.label} (${candidateModelId}) [${attemptLabel}]. Quality=${imageModelConfig.quality}, Steps=${imageModelConfig.steps}, Upscale=${imageModelConfig.upscale}. Timeout=${Math.round(requestTimeoutMs / 1000)}s. Prompt: ${promptText}`);
                 console.time(timerLabel);
                 try {
-                    return await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${currentKey}`, {
+                    return await fetchWithTimeout(`/gemini-proxy/v1beta/models/${candidateModelId}:generateContent?key=${currentKey}`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
@@ -883,25 +940,57 @@ Guidelines:
                 }
             };
 
+            const requestImageWithModelFallback = async (imageParts, requestTimeoutMs, attemptLabel) => {
+                let lastResponse = null;
+                let lastData = null;
+
+                for (const candidateModelId of candidateModelIds) {
+                    const candidateResponse = await requestNanoBananaImage(imageParts, requestTimeoutMs, attemptLabel, candidateModelId);
+                    const candidateData = await candidateResponse.json();
+
+                    if (candidateResponse.ok) {
+                        return { response: candidateResponse, data: candidateData, resolvedModelId: candidateModelId };
+                    }
+
+                    lastResponse = candidateResponse;
+                    lastData = candidateData;
+
+                    const errorMessage = candidateData.error?.message || '';
+                    const canTryNextModel = candidateResponse.status === 404 && /not found|not supported/i.test(errorMessage);
+                    if (!canTryNextModel) {
+                        break;
+                    }
+
+                    addLog('ERROR', `${candidateModelId} is unavailable for image generation. Trying next Gemini image model.`);
+                }
+
+                return {
+                    response: lastResponse,
+                    data: lastData || {},
+                    resolvedModelId: candidateModelIds[candidateModelIds.length - 1]
+                };
+            };
+
             let response;
+            let data;
+            let resolvedModelId;
             try {
-                response = await requestNanoBananaImage(buildImageParts(false), timeoutMs, 'full prompt');
+                ({ response, data, resolvedModelId } = await requestImageWithModelFallback(buildImageParts(false), timeoutMs, 'full prompt'));
             } catch (error) {
                 if (!isFastImageModel || !error.message.includes('timed out')) {
                     throw error;
                 }
                 addLog('ERROR', `Scene ${sceneIndex + 1} full prompt timed out on NanoBanana 2. Retrying once with compressed prompt.`);
-                response = await requestNanoBananaImage(buildImageParts(true), 120000, 'compressed retry');
+                ({ response, data, resolvedModelId } = await requestImageWithModelFallback(buildImageParts(true), 120000, 'compressed retry'));
             }
 
-            const data = await response.json();
             console.log('Image API Response (Scene ' + (sceneIndex + 1) + '):', data.candidates?.[0]?.content ? 'Success' : 'Failed');
 
             if (!response.ok) {
                 if (response.status === 429) {
                     throw new Error('Rate Limit Hit');
                 }
-                throw new Error(`API Error (${response.status}): ${data.error?.message || 'Unknown error'}`);
+                throw new Error(`API Error (${response.status}) using ${resolvedModelId}: ${data.error?.message || 'Unknown error'}`);
             }
 
             // Check multiple possible response formats
@@ -1218,6 +1307,8 @@ Guidelines:
 
             await Promise.all([
                 ...orderedVideos.map((_, index) => ffmpeg.deleteFile(`scene_${String(index + 1).padStart(3, '0')}.mp4`).catch(() => {})),
+                ...orderedVideos.map((_, index) => ffmpeg.deleteFile(`scene_audio_${String(index + 1).padStart(3, '0')}.mp3`).catch(() => {})),
+                ...orderedVideos.map((_, index) => ffmpeg.deleteFile(`scene_muxed_${String(index + 1).padStart(3, '0')}.mp4`).catch(() => {})),
                 ffmpeg.deleteFile('concat_list.txt').catch(() => {}),
                 ffmpeg.deleteFile('output.mp4').catch(() => {})
             ]);
@@ -1235,8 +1326,49 @@ Guidelines:
 
                 const videoBlob = await videoResponse.blob();
                 await ffmpeg.writeFile(filename, await fetchFile(videoBlob));
-                inputFiles.push(filename);
                 addLog('SUCCESS', `[FFMPEG] Scene ${index + 1} written to VFS as ${filename} (${(videoBlob.size / 1024 / 1024).toFixed(2)} MB).`);
+
+                const muxedFilename = `scene_muxed_${String(i + 1).padStart(3, '0')}.mp4`;
+                if (scene.audioUrl) {
+                    const audioFilename = `scene_audio_${String(i + 1).padStart(3, '0')}.mp3`;
+                    setAssemblyProgress(`Mixing voiceover for Scene ${index + 1}...`);
+                    addLog('FFMPEG', `Loading voiceover for Scene ${index + 1} from ${scene.audioUrl}`);
+
+                    const audioResponse = await fetch(scene.audioUrl);
+                    if (!audioResponse.ok) {
+                        throw new Error(`Failed to fetch Scene ${index + 1} audio (${audioResponse.status})`);
+                    }
+
+                    const audioBlob = await audioResponse.blob();
+                    await ffmpeg.writeFile(audioFilename, await fetchFile(audioBlob));
+                    addLog('FFMPEG', `Muxing Scene ${index + 1} video with ${scene.audioSource || 'voiceover'} audio.`);
+                    await ffmpeg.exec([
+                        '-i', filename,
+                        '-i', audioFilename,
+                        '-map', '0:v:0',
+                        '-map', '1:a:0',
+                        '-c:v', 'copy',
+                        '-c:a', 'aac',
+                        '-shortest',
+                        muxedFilename
+                    ]);
+                    inputFiles.push(muxedFilename);
+                } else {
+                    setAssemblyProgress(`Adding silent audio track for Scene ${index + 1}...`);
+                    await ffmpeg.exec([
+                        '-i', filename,
+                        '-f', 'lavfi',
+                        '-t', String(scene.duration || 5),
+                        '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+                        '-map', '0:v:0',
+                        '-map', '1:a:0',
+                        '-c:v', 'copy',
+                        '-c:a', 'aac',
+                        '-shortest',
+                        muxedFilename
+                    ]);
+                    inputFiles.push(muxedFilename);
+                }
             }
 
             const concatList = inputFiles.map(filename => `file '${filename}'`).join('\n');
@@ -1475,7 +1607,7 @@ Guidelines:
         };
         const uploadEndpoints = [
             'https://kieai.redpandaai.co/api/file-base64-upload',
-            'https://api.kie.ai/api/file-base64-upload'
+            '/kie-proxy/api/file-base64-upload'
         ];
 
         let uploadResponse = null;
@@ -1531,10 +1663,12 @@ Guidelines:
     // Generate video for single scene using Kie.ai API
     const generateSceneVideo = async (sceneIndex) => {
         const scene = scenes[sceneIndex];
+        const startFrameSource = scene.startFrame || scene.generatedImage;
+        const endFrameSource = scene.endFrame;
         
-        if (!scene.generatedImage) {
+        if (!startFrameSource) {
             addLog('ERROR', `Scene ${sceneIndex + 1} video generation blocked: no image available.`);
-            alert('Please generate or upload an image first');
+            alert('Please generate, upload, or assign a Start Frame first');
             return;
         }
 
@@ -1561,9 +1695,13 @@ Guidelines:
         updatedScenes[sceneIndex].videoPrompt = activeVideoPrompt;
         setScenes(updatedScenes);
 
+        let taskSubmitted = false;
         try {
-            const kieImage = await normalizeImageForKie(scene.generatedImage);
-            const kieImageUrl = await getKieImageUrl(kieImage, sceneIndex, videoAbortController.signal);
+            const kieStartImage = await normalizeImageForKie(startFrameSource);
+            const kieStartImageUrl = await getKieImageUrl(kieStartImage, sceneIndex, videoAbortController.signal);
+            const kieEndImage = endFrameSource ? await normalizeImageForKie(endFrameSource) : null;
+            const kieEndImageUrl = kieEndImage ? await getKieImageUrl(kieEndImage, sceneIndex, videoAbortController.signal) : null;
+            const kieImageUrls = kieEndImageUrl ? [kieStartImageUrl, kieEndImageUrl] : [kieStartImageUrl];
             const videoConfig = VIDEO_MODEL_CONFIGS[activeVideoEngine] || VIDEO_MODEL_CONFIGS['veo-3.1-fast'];
             const submittedVideoPrompt = transformVideoPrompt(activeVideoPrompt, activeVideoEngine);
             const klingNegativePrompt = isKlingVideoModel(activeVideoEngine) ? KLING_NEGATIVE_PROMPT : null;
@@ -1577,14 +1715,17 @@ Guidelines:
             console.log(`   Engine: ${activeVideoEngine}`);
             console.log(`   Model: ${model}`);
             console.log(`   Endpoint: ${endpoint}`);
-            addLog('API_CALL', `Scene ${sceneIndex + 1} image prepared for Kie.ai: source=${kieImage.sourceType}, mime=${kieImage.mimeType}, approxBytes=${kieImage.byteLength}, imagePreview=${kieImage.preview}`);
-            addLog('API_CALL', `Submitting Scene ${sceneIndex + 1} to Kie.ai I2V. Engine=${activeVideoEngine}, Model=${model}, Endpoint=${endpoint}, Mode=${videoConfig.mode || 'default'}, Resolution=${videoResolution}, Audio=${videoAudio && scene.dialogue ? 'ON' : 'OFF'}, imageUrls[0]=${kieImageUrl}. Prompt: ${submittedVideoPrompt}`);
+            addLog('API_CALL', `Scene ${sceneIndex + 1} start frame prepared for Kie.ai: source=${kieStartImage.sourceType}, mime=${kieStartImage.mimeType}, approxBytes=${kieStartImage.byteLength}, imagePreview=${kieStartImage.preview}`);
+            if (kieEndImage) {
+                addLog('API_CALL', `Scene ${sceneIndex + 1} end frame prepared for Kie.ai: source=${kieEndImage.sourceType}, mime=${kieEndImage.mimeType}, approxBytes=${kieEndImage.byteLength}, imagePreview=${kieEndImage.preview}`);
+            }
+            addLog('API_CALL', `Submitting Scene ${sceneIndex + 1} to Kie.ai I2V. Engine=${activeVideoEngine}, Model=${model}, Endpoint=${endpoint}, Mode=${videoConfig.mode || 'default'}, Resolution=${videoResolution}, Audio=${videoAudio && scene.dialogue ? 'ON' : 'OFF'}, imageUrls=${kieImageUrls.join(' → ')}. Prompt: ${submittedVideoPrompt}`);
 
             const requestBody = videoConfig.provider === 'veo'
                 ? {
                     model: model,
                     prompt: submittedVideoPrompt,
-                    imageUrls: [kieImageUrl],
+                    imageUrls: kieImageUrls,
                     generationType: 'FIRST_AND_LAST_FRAMES_2_VIDEO',
                     duration: scene.duration,
                     aspect_ratio: '9:16',
@@ -1596,8 +1737,8 @@ Guidelines:
                     input: {
                         prompt: submittedVideoPrompt,
                         negative_prompt: klingNegativePrompt,
-                        image_url: kieImageUrl,
-                        image_urls: [kieImageUrl],
+                        image_url: kieStartImageUrl,
+                        image_urls: kieImageUrls,
                         duration: String(scene.duration),
                         aspect_ratio: '9:16',
                         mode: videoConfig.mode,
@@ -1609,17 +1750,17 @@ Guidelines:
             const requestBodyLog = videoConfig.provider === 'veo'
                 ? {
                     ...requestBody,
-                    imageUrls: [kieImageUrl],
-                    uploadedImageSource: `[${kieImage.sourceType} ${kieImage.mimeType}, approx ${kieImage.byteLength} bytes] ${kieImage.preview}`
+                    imageUrls: kieImageUrls,
+                    uploadedImageSource: `start=[${kieStartImage.sourceType} ${kieStartImage.mimeType}, approx ${kieStartImage.byteLength} bytes] ${kieStartImage.preview}${kieEndImage ? `; end=[${kieEndImage.sourceType} ${kieEndImage.mimeType}, approx ${kieEndImage.byteLength} bytes] ${kieEndImage.preview}` : ''}`
                 }
                 : {
                     ...requestBody,
                     input: {
                         ...requestBody.input,
-                        image_url: kieImageUrl,
-                        image_urls: [kieImageUrl]
+                        image_url: kieStartImageUrl,
+                        image_urls: kieImageUrls
                     },
-                    uploadedImageSource: `[${kieImage.sourceType} ${kieImage.mimeType}, approx ${kieImage.byteLength} bytes] ${kieImage.preview}`
+                    uploadedImageSource: `start=[${kieStartImage.sourceType} ${kieStartImage.mimeType}, approx ${kieStartImage.byteLength} bytes] ${kieStartImage.preview}${kieEndImage ? `; end=[${kieEndImage.sourceType} ${kieEndImage.mimeType}, approx ${kieEndImage.byteLength} bytes] ${kieEndImage.preview}` : ''}`
                 };
             addLog('API_CALL', `Kie.ai request payload for Scene ${sceneIndex + 1}:\n${JSON.stringify(requestBodyLog, null, 2)}`);
 
@@ -1627,7 +1768,7 @@ Guidelines:
             console.time(videoTimerLabel);
             let response;
             try {
-                response = await fetch(`https://api.kie.ai${endpoint}`, {
+                response = await fetch(`/kie-proxy${endpoint}`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -1679,6 +1820,7 @@ Guidelines:
             addLog('SUCCESS', `Kie.ai task submitted for Scene ${sceneIndex + 1}. Task ID: ${taskId}`);
 
             // Start unified polling for this task
+            taskSubmitted = true;
             startUnifiedPolling(sceneIndex, taskId, activeVideoEngine);
 
         } catch (error) {
@@ -1692,7 +1834,7 @@ Guidelines:
             updatedScenes[sceneIndex].error = isCancelled ? null : error.message;
             setScenes([...updatedScenes]);
         } finally {
-            if (videoAbortControllersRef.current.get(sceneIndex) === videoAbortController) {
+            if (!taskSubmitted && videoAbortControllersRef.current.get(sceneIndex) === videoAbortController) {
                 videoAbortControllersRef.current.delete(sceneIndex);
             }
         }
@@ -1707,14 +1849,27 @@ Guidelines:
         // Determine the correct polling endpoint based on engine
         const isVeo = videoConfig.pollFamily === 'veo';
         const pollEndpoint = isVeo 
-            ? `https://api.kie.ai/api/v1/veo/record-info?taskId=${taskId}`
-            : `https://api.kie.ai/api/v1/jobs/recordInfo?taskId=${taskId}`;
+            ? `/kie-proxy/api/v1/veo/record-info?taskId=${taskId}`
+            : `/kie-proxy/api/v1/jobs/recordInfo?taskId=${taskId}`;
         
         console.log(`📍 Using ${isVeo ? 'Veo' : 'Kling'} polling endpoint: ${pollEndpoint}`);
         addLog('POLLING', `Polling endpoint selected: ${pollEndpoint}`);
         let pollCount = 0;
         
         const pollInterval = setInterval(async () => {
+            const sceneStillActive = videoAbortControllersRef.current.has(sceneIndex);
+            if (!sceneStillActive) {
+                clearInterval(pollInterval);
+                videoPollingIntervalsRef.current.delete(sceneIndex);
+                videoPollingIntervalsRef.current.delete(taskId);
+                setVideoPollingMap(prev => {
+                    const newMap = new Map(prev);
+                    newMap.delete(taskId);
+                    return newMap;
+                });
+                return;
+            }
+
             try {
                 pollCount += 1;
                 const response = await fetch(pollEndpoint, {
@@ -1731,6 +1886,12 @@ Guidelines:
                 }
 
                 const data = await response.json();
+                if (!videoAbortControllersRef.current.has(sceneIndex)) {
+                    clearInterval(pollInterval);
+                    videoPollingIntervalsRef.current.delete(sceneIndex);
+                    videoPollingIntervalsRef.current.delete(taskId);
+                    return;
+                }
                 
                 if (data.code !== 200) {
                     console.error(`❌ API returned error code: ${data.code}, message: ${data.msg}`);
@@ -1783,11 +1944,15 @@ Guidelines:
                         
                         if (videoUrl) {
                             updatedScenes[sceneIndex].videoUrl = videoUrl;
+                            updatedScenes[sceneIndex].videoEngine = engine;
                             updatedScenes[sceneIndex].isGeneratingVideo = false;
                             updatedScenes[sceneIndex].videoStatus = 'completed';
                             updatedScenes[sceneIndex].videoProgress = 100;
                             setScenes([...updatedScenes]);
                             addLog('SUCCESS', `Scene ${sceneIndex + 1} Veo video completed. URL: ${videoUrl}`);
+                            videoAbortControllersRef.current.delete(sceneIndex);
+                            videoPollingIntervalsRef.current.delete(sceneIndex);
+                            videoPollingIntervalsRef.current.delete(taskId);
                             clearInterval(pollInterval);
                             setVideoPollingMap(prev => {
                                 const newMap = new Map(prev);
@@ -1802,6 +1967,9 @@ Guidelines:
                             updatedScenes[sceneIndex].videoProgress = 100;
                             updatedScenes[sceneIndex].error = 'Video generated but URL not found in response. Check console for details.';
                             setScenes([...updatedScenes]);
+                            videoAbortControllersRef.current.delete(sceneIndex);
+                            videoPollingIntervalsRef.current.delete(sceneIndex);
+                            videoPollingIntervalsRef.current.delete(taskId);
                             clearInterval(pollInterval);
                             setVideoPollingMap(prev => {
                                 const newMap = new Map(prev);
@@ -1812,11 +1980,18 @@ Guidelines:
                     } else if (successFlag === 2 || successFlag === 3) {
                         // Failed
                         console.error(`❌ Veo video failed for Scene ${sceneIndex + 1}, successFlag=${successFlag}`);
-                        addLog('ERROR', `Scene ${sceneIndex + 1} Veo failed. successFlag=${successFlag}. ${taskData.errorMessage || ''}`);
+                        const veoFailureMessage = taskData.errorMessage || 'Video generation failed';
+                        const isSafetyBlock = /safety|restricted|third-party|copyright|content/i.test(veoFailureMessage);
+                        addLog('ERROR', `Scene ${sceneIndex + 1} Veo failed. successFlag=${successFlag}. ${veoFailureMessage}${isSafetyBlock ? ' Try replacing the Start/End frame with original non-IP clay assets and remove brand/character references from the prompt.' : ''}`);
                         updatedScenes[sceneIndex].isGeneratingVideo = false;
                         updatedScenes[sceneIndex].videoStatus = 'failed';
-                        updatedScenes[sceneIndex].error = 'Video generation failed';
+                        updatedScenes[sceneIndex].error = isSafetyBlock
+                            ? `Safety filters blocked the request: ${veoFailureMessage}`
+                            : veoFailureMessage;
                         setScenes([...updatedScenes]);
+                        videoAbortControllersRef.current.delete(sceneIndex);
+                        videoPollingIntervalsRef.current.delete(sceneIndex);
+                        videoPollingIntervalsRef.current.delete(taskId);
                         clearInterval(pollInterval);
                         setVideoPollingMap(prev => {
                             const newMap = new Map(prev);
@@ -1848,11 +2023,15 @@ Guidelines:
                         
                         if (videoUrl) {
                             updatedScenes[sceneIndex].videoUrl = videoUrl;
+                            updatedScenes[sceneIndex].videoEngine = engine;
                             updatedScenes[sceneIndex].isGeneratingVideo = false;
                             updatedScenes[sceneIndex].videoStatus = 'completed';
                             updatedScenes[sceneIndex].videoProgress = 100;
                             setScenes([...updatedScenes]);
                             addLog('SUCCESS', `Scene ${sceneIndex + 1} Kling video completed. URL: ${videoUrl}`);
+                            videoAbortControllersRef.current.delete(sceneIndex);
+                            videoPollingIntervalsRef.current.delete(sceneIndex);
+                            videoPollingIntervalsRef.current.delete(taskId);
                             clearInterval(pollInterval);
                             setVideoPollingMap(prev => {
                                 const newMap = new Map(prev);
@@ -1868,6 +2047,9 @@ Guidelines:
                         updatedScenes[sceneIndex].videoStatus = 'failed';
                         updatedScenes[sceneIndex].error = taskData.failReason || 'Video generation failed';
                         setScenes([...updatedScenes]);
+                        videoAbortControllersRef.current.delete(sceneIndex);
+                        videoPollingIntervalsRef.current.delete(sceneIndex);
+                        videoPollingIntervalsRef.current.delete(taskId);
                         clearInterval(pollInterval);
                         setVideoPollingMap(prev => {
                             const newMap = new Map(prev);
@@ -1883,6 +2065,8 @@ Guidelines:
         }, 3000); // Poll every 3 seconds
 
         // Store interval in map for cleanup
+        videoPollingIntervalsRef.current.set(sceneIndex, pollInterval);
+        videoPollingIntervalsRef.current.set(taskId, pollInterval);
         setVideoPollingMap(prev => new Map(prev).set(taskId, pollInterval));
     };
 
@@ -1938,7 +2122,10 @@ Guidelines:
     const cancelSceneVideoGeneration = (sceneIndex) => {
         const scene = scenes[sceneIndex];
         const controller = videoAbortControllersRef.current.get(sceneIndex);
-        if (!controller && !scene?.videoTaskId) {
+        const intervalFromScene = videoPollingIntervalsRef.current.get(sceneIndex);
+        const intervalFromTask = scene?.videoTaskId ? videoPollingIntervalsRef.current.get(scene.videoTaskId) : null;
+
+        if (!controller && !scene?.videoTaskId && !intervalFromScene && !intervalFromTask) {
             addLog('API_CALL', `Scene ${sceneIndex + 1} video cancellation ignored because no video request is active.`);
             return;
         }
@@ -1946,10 +2133,16 @@ Guidelines:
         controller?.abort();
         videoAbortControllersRef.current.delete(sceneIndex);
 
+        if (intervalFromScene) {
+            clearInterval(intervalFromScene);
+            videoPollingIntervalsRef.current.delete(sceneIndex);
+        }
+
         if (scene?.videoTaskId) {
-            const intervalId = videoPollingMap.get(scene.videoTaskId);
+            const intervalId = intervalFromTask || videoPollingMap.get(scene.videoTaskId);
             if (intervalId) {
                 clearInterval(intervalId);
+                videoPollingIntervalsRef.current.delete(scene.videoTaskId);
                 setVideoPollingMap(prev => {
                     const newMap = new Map(prev);
                     newMap.delete(scene.videoTaskId);
@@ -1960,7 +2153,7 @@ Guidelines:
 
         setScenes(prevScenes => prevScenes.map((item, index) => (
             index === sceneIndex
-                ? { ...item, isGeneratingVideo: false, videoStatus: 'pending', videoProgress: 0, error: null }
+                ? { ...item, isGeneratingVideo: false, videoStatus: 'pending', videoProgress: 0, videoTaskId: null, error: null }
                 : item
         )));
         addLog('SUCCESS', `Manual cancellation: Scene ${sceneIndex + 1} video generation stopped.`);
@@ -1991,8 +2184,27 @@ Guidelines:
     const totalDuration = scenes.reduce((sum, scene) => sum + (Number(scene.duration) || 0), 0);
     const scenesWithImagesCount = scenes.filter(scene => scene.generatedImage).length;
     const scenesWithVideosCount = scenes.filter(scene => scene.videoUrl).length;
+    const scenesWithAudioCount = scenes.filter(scene => scene.audioUrl).length;
     const selectedAssemblyVideosCount = selectedAssemblySceneIndexes.filter(index => scenes[index]?.videoUrl).length;
     const filteredLogs = logFilter === 'ALL' ? logs : logs.filter(log => log.type === logFilter);
+
+    // Live budget — recomputed only when scenes array changes (memoized)
+    const liveBudget = React.useMemo(() => {
+        const imagePts = scenesWithImagesCount * PTS_COST.image;
+        const videoPts = scenesWithVideosCount * PTS_COST.video;
+        const audioPts = scenesWithAudioCount * PTS_COST.voiceover;
+        const total = imagePts + videoPts + audioPts;
+
+        // Per-engine video breakdown
+        const engineBreakdown = {};
+        scenes.forEach(scene => {
+            if (!scene.videoUrl || !scene.videoEngine) return;
+            const label = VIDEO_MODEL_CONFIGS[scene.videoEngine]?.label || scene.videoEngine;
+            engineBreakdown[label] = (engineBreakdown[label] || 0) + PTS_COST.video;
+        });
+
+        return { imagePts, videoPts, audioPts, total, engineBreakdown };
+    }, [scenes, scenesWithImagesCount, scenesWithVideosCount, scenesWithAudioCount]);
 
     const getSceneStatus = (scene) => {
         if (!scene) return 'Draft';
@@ -2085,10 +2297,19 @@ Guidelines:
         return {
             text: title,
             dialogue: '',
+            narratorScript: '',
+            audioUrl: null,
+            audioFileName: '',
+            audioSource: '',
+            isGeneratingAudio: false,
+            voiceId: VOICE_CONFIG[0].id,
+            voiceVibe: 'Neutral',
             duration: 5,
             frameDescription: 'Describe your scene here...',
             imagePrompt: '',
             generatedImage: null,
+            startFrame: null,   // I2V start frame (defaults to generatedImage)
+            endFrame: null,     // I2V end frame (continuity from prev scene)
             isGenerating: false,
             error: null,
             videoPrompt: '',
@@ -2097,7 +2318,8 @@ Guidelines:
             videoTaskId: null,
             videoProgress: 0,
             videoStatus: 'pending',
-            isGeneratingVideo: false
+            isGeneratingVideo: false,
+            videoEngine: null   // which engine produced the video
         };
     }
 
@@ -2120,6 +2342,205 @@ Guidelines:
     const logPromptModification = (index, label) => {
         addLog('SUCCESS', `Manual modification: Scene ${index + 1} ${label} updated by user.`);
     };
+
+    const setSceneAudio = (sceneIndex, audioUrl, audioFileName, audioSource) => {
+        setScenes(prev => prev.map((scene, index) => {
+            if (index !== sceneIndex) return scene;
+            if (scene.audioUrl && scene.audioUrl.startsWith('blob:')) {
+                URL.revokeObjectURL(scene.audioUrl);
+            }
+            return {
+                ...scene,
+                audioUrl,
+                audioFileName,
+                audioSource,
+                isGeneratingAudio: false
+            };
+        }));
+    };
+
+    const handleSceneAudioUpload = (sceneIndex, file) => {
+        if (!file) return;
+        const audioUrl = URL.createObjectURL(file);
+        setSceneAudio(sceneIndex, audioUrl, file.name, 'upload');
+        addLog('SUCCESS', `Scene ${sceneIndex + 1} audio uploaded manually: ${file.name}. This overrides any AI-generated audio.`);
+    };
+
+    const playVoiceSample = (voice) => {
+        if (!voice?.sampleUrl) return;
+
+        if (sampleAudioRef.current && playingVoiceSample === voice.id) {
+            sampleAudioRef.current.pause();
+            sampleAudioRef.current = null;
+            setPlayingVoiceSample('');
+            return;
+        }
+
+        if (sampleAudioRef.current) {
+            sampleAudioRef.current.pause();
+        }
+
+        const audio = new Audio(voice.sampleUrl);
+        sampleAudioRef.current = audio;
+        setPlayingVoiceSample(voice.id);
+        audio.onended = () => setPlayingVoiceSample('');
+        audio.onerror = () => {
+            setPlayingVoiceSample('');
+            addLog('ERROR', `Voice sample failed to play: ${voice.name}. Check public${voice.sampleUrl}.`);
+        };
+        audio.play().catch(error => {
+            setPlayingVoiceSample('');
+            addLog('ERROR', `Voice sample playback blocked: ${error.message}`);
+        });
+    };
+
+    const generateNarratorAudio = async (sceneIndex) => {
+        const scene = scenes[sceneIndex];
+        const narratorScript = scene?.narratorScript?.trim() || scene?.dialogue?.trim() || scene?.text?.trim();
+        const selectedVoiceId = normalizeVoiceId(scene?.voiceId);
+        const selectedVibe = scene?.voiceVibe || 'Neutral';
+
+        if (!openAIKey.trim()) {
+            alert('Please enter your OpenAI API key for narrator audio.');
+            addLog('ERROR', `Scene ${sceneIndex + 1} audio generation blocked: missing OpenAI API key.`);
+            return;
+        }
+
+        if (!narratorScript) {
+            alert('Add narrator script or dialogue before generating voiceover.');
+            addLog('ERROR', `Scene ${sceneIndex + 1} audio generation blocked: empty narrator script.`);
+            return;
+        }
+
+        if (audioAbortControllersRef.current.has(sceneIndex)) {
+            addLog('API_CALL', `Scene ${sceneIndex + 1} audio generation already running. Duplicate request ignored.`);
+            return;
+        }
+
+        const audioAbortController = new AbortController();
+        audioAbortControllersRef.current.set(sceneIndex, audioAbortController);
+        setScenes(prev => prev.map((item, index) => (
+            index === sceneIndex ? { ...item, isGeneratingAudio: true } : item
+        )));
+
+        try {
+            addLog('API_CALL', `Generating OpenAI TTS audio for Scene ${sceneIndex + 1}. Voice=${selectedVoiceId}, vibe=${selectedVibe}. Script: ${narratorScript}`);
+            const response = await fetch('/openai-proxy/v1/audio/speech', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${openAIKey}`
+                },
+                signal: audioAbortController.signal,
+                body: JSON.stringify({
+                    model: 'tts-1',
+                    voice: selectedVoiceId,
+                    input: narratorScript,
+                    response_format: 'mp3'
+                })
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`OpenAI TTS Error (${response.status}): ${errorText}`);
+            }
+
+            const audioBlob = await response.blob();
+            const audioUrl = URL.createObjectURL(audioBlob);
+            const audioFileName = `scene_${sceneIndex + 1}_${selectedVoiceId}_${selectedVibe.toLowerCase()}.mp3`;
+            setSceneAudio(sceneIndex, audioUrl, audioFileName, 'tts-1');
+            addLog('SUCCESS', `Scene ${sceneIndex + 1} AI narrator audio generated (${(audioBlob.size / 1024).toFixed(1)} KB).`);
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                addLog('SUCCESS', `Scene ${sceneIndex + 1} audio generation cancelled.`);
+            } else {
+                console.error('Narrator audio generation error:', error);
+                addLog('ERROR', `Scene ${sceneIndex + 1} audio generation failed: ${error.message}`);
+                alert(`Audio generation failed: ${error.message}`);
+            }
+            setScenes(prev => prev.map((item, index) => (
+                index === sceneIndex ? { ...item, isGeneratingAudio: false } : item
+            )));
+        } finally {
+            audioAbortControllersRef.current.delete(sceneIndex);
+        }
+    };
+
+    // ── Asset Tray helpers ──────────────────────────────────────────────────
+
+    /** Open the tray for a specific scene + slot ('start' or 'end') */
+    const openAssetTray = useCallback((sceneIndex, slot) => {
+        setAssetTraySceneIndex(sceneIndex);
+        setAssetTraySlot(slot);
+        setAssetTrayOpen(true);
+    }, []);
+
+    /** Assign an image to startFrame or endFrame */
+    const assignFrameSlot = useCallback((sceneIndex, slot, imageDataOrUrl) => {
+        setScenes(prev => prev.map((scene, i) => (
+            i === sceneIndex ? { ...scene, [slot === 'start' ? 'startFrame' : 'endFrame']: imageDataOrUrl } : scene
+        )));
+        setAssetTrayOpen(false);
+        addLog('SUCCESS', `Scene ${sceneIndex + 1} ${slot} frame assigned.`);
+    }, [addLog]);
+
+    /** Handle file upload into a frame slot */
+    const handleFrameSlotUpload = useCallback((sceneIndex, slot, file) => {
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onloadend = () => assignFrameSlot(sceneIndex, slot, reader.result);
+        reader.readAsDataURL(file);
+    }, [assignFrameSlot]);
+
+    /** Extract the last frame of a source scene's video and assign it to a target frame slot. */
+    const captureLastVideoFrame = useCallback((sourceSceneIndex, targetSceneIndex = sourceSceneIndex, targetSlot = 'end') => {
+        const scene = scenes[sourceSceneIndex];
+        if (!scene?.videoUrl) return;
+
+        addLog('API_CALL', `Extracting last frame from Scene ${sourceSceneIndex + 1} video for continuity.`);
+        const video = document.createElement('video');
+        video.crossOrigin = 'anonymous';
+        video.src = scene.videoUrl;
+        video.preload = 'metadata';
+
+        video.onloadedmetadata = () => {
+            video.currentTime = Math.max(0, video.duration - 0.1);
+        };
+
+        video.onseeked = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth || 720;
+            canvas.height = video.videoHeight || 1280;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const frame = canvas.toDataURL('image/jpeg', 0.92);
+            assignFrameSlot(targetSceneIndex, targetSlot, frame);
+            addLog('SUCCESS', `Scene ${sourceSceneIndex + 1} last frame assigned to Scene ${targetSceneIndex + 1} ${targetSlot} frame.`);
+        };
+
+        video.onerror = () => addLog('ERROR', `Could not extract last frame from Scene ${sourceSceneIndex + 1} video.`);
+        video.load();
+    }, [scenes, assignFrameSlot, addLog]);
+
+    /** Clipboard paste handler for frame slots */
+    const handleFrameClipboardPaste = useCallback(async (sceneIndex, slot) => {
+        try {
+            const clipboardItems = await navigator.clipboard.read();
+            for (const item of clipboardItems) {
+                const imageType = item.types.find(t => t.startsWith('image/'));
+                if (imageType) {
+                    const blob = await item.getType(imageType);
+                    const reader = new FileReader();
+                    reader.onloadend = () => assignFrameSlot(sceneIndex, slot, reader.result);
+                    reader.readAsDataURL(blob);
+                    return;
+                }
+            }
+            addLog('ERROR', 'No image found in clipboard.');
+        } catch {
+            addLog('ERROR', 'Clipboard read failed. Make sure you have a copied image.');
+        }
+    }, [assignFrameSlot, addLog]);
 
     const deleteScene = (index) => {
         if (confirm('Delete this scene?')) {
@@ -2180,7 +2601,7 @@ Guidelines:
                         <ClayStudioLogo />
                         <div className="min-w-0">
                             <div className="flex items-center gap-2">
-                                <h1 className="text-base font-extrabold tracking-tight truncate">Clay Studio</h1>
+                                <h1 className="text-base font-extrabold tracking-tight truncate" style={{ color: '#E8896A' }}>Clay Studio</h1>
                                 <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-[#C8714F]/20 text-[#E8896A] border border-[#C8714F]/30">PRO</span>
                             </div>
                         </div>
@@ -2241,7 +2662,7 @@ Guidelines:
                                 <span className="w-8 h-8 rounded-xl bg-[#C8714F]/15 flex items-center justify-center">🎬</span>
                                 Step 1 · Your Story
                             </div>
-                            <h2 className="text-4xl lg:text-5xl font-black tracking-tight leading-tight mb-3">Turn a script into a finished clay video.</h2>
+                            <h2 className="text-4xl lg:text-5xl font-black tracking-tight leading-tight mb-3" style={{ color: '#FFFFFF' }}>Turn a script into a finished clay video.</h2>
                             <p className="text-slate-400 text-base max-w-xl mb-6">Write or paste your script, set up your character, then let Clay Studio break it into timed scenes automatically.</p>
 
                             <label className="text-sm font-semibold text-slate-300 mb-2 block">Video Script</label>
@@ -2369,99 +2790,191 @@ Guidelines:
                                 ))}
                             </div>
                         )}
-                        {/* placeholder end */}
-                        <div className="hidden">
+                    </section>
+                )}
+
+                {/* ─── STEP 3: IMAGES ─── */}
+                {wizardStep === 3 && (
+                    <section>
+                        <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
+                            <div>
+                                <h2 className="text-2xl font-black">Frame Generation</h2>
+                                <p className="text-slate-400 text-sm mt-1">Generate or upload a 9:16 clay frame for each scene.</p>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                                <button onClick={generateAllImages} disabled={isGeneratingImages} className="rounded-xl bg-cyan-600 hover:bg-cyan-700 disabled:opacity-50 px-4 py-2 text-sm font-bold transition">
+                                    {isGeneratingImages ? `⏳ Generating… ${generationProgress.completed}/${generationProgress.total}` : '🚀 Generate All Frames'}
+                                </button>
+                                <button onClick={lockCharacterFromSceneOne} disabled={!scenes[0]?.generatedImage || isGeneratingImages} className="rounded-xl bg-emerald-600/20 border border-emerald-600/40 text-emerald-300 hover:border-emerald-400/70 disabled:opacity-40 px-4 py-2 text-sm font-semibold transition">🔒 Lock Character</button>
+                                {scenesWithImagesCount > 0 && <button onClick={downloadAllFrames} className="rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 px-4 py-2 text-sm font-semibold">📦 ZIP Frames</button>}
+                            </div>
+                        </div>
+
+                        {isGeneratingImages && (
+                            <div className="bg-cyan-500/10 border border-cyan-500/30 rounded-2xl p-4 mb-4">
+                                <div className="flex items-center justify-between mb-2">
+                                    <span className="text-sm font-semibold">{activeImageModel === 'nanoBanana2' ? '⚡ Fast-track generation in progress...' : '⏳ Crafting high-fidelity frames...'}</span>
+                                    <span className="text-sm font-bold text-cyan-400">{generationProgress.completed}/{generationProgress.total}</span>
+                                </div>
+                                <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
+                                    <div className="bg-gradient-to-r from-cyan-500 to-[#C8714F] h-full transition-all duration-500" style={{ width: `${generationProgress.total ? (generationProgress.completed / generationProgress.total) * 100 : 0}%` }}></div>
+                                </div>
+                            </div>
+                        )}
+
+                        {scenesWithImagesCount === 0 && !isGeneratingImages && (
+                            <div className="bg-purple-500/10 border border-purple-500/30 rounded-2xl p-3 mb-4 text-sm">
+                                💡 <strong>Pro Tip:</strong> Click "Generate All Frames" or upload your own images per scene. Use "Lock Character" after Scene 1 for consistency.
+                            </div>
+                        )}
+
+                        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+                            {scenes.map((scene, index) => (
+                                <div key={index} className="bg-slate-900 border border-slate-700/60 rounded-2xl overflow-hidden hover:border-cyan-500/40 transition-all">
+                                    <div className="relative bg-slate-950" style={{ aspectRatio: '9/16' }}>
+                                        {scene.isGenerating ? (
+                                            <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900/70 p-3">
+                                                <div className="w-7 h-7 border-[3px] border-slate-700 border-t-cyan-500 rounded-full animate-spin mb-2"></div>
+                                                <span className="text-[10px] text-cyan-400 font-semibold text-center">{scene.imageStatusText || 'Generating...'}</span>
+                                                <div className="w-3/4 bg-slate-800 rounded-full h-1 overflow-hidden mt-2">
+                                                    <div className="bg-gradient-to-r from-cyan-500 to-[#C8714F] h-full transition-all duration-500" style={{ width: `${scene.imageProgress || 5}%` }}></div>
+                                                </div>
+                                            </div>
+                                        ) : scene.generatedImage ? (
+                                            <>
+                                                <img src={scene.generatedImage} alt={`Scene ${index + 1}`} className="w-full h-full object-cover" />
+                                                {scene.isManualUpload && <div className="absolute top-1.5 right-1.5 bg-purple-500 text-white text-[9px] px-1.5 py-0.5 rounded font-bold">Upload</div>}
+                                            </>
+                                        ) : scene.error ? (
+                                            <div className="absolute inset-0 flex flex-col items-center justify-center text-red-400 text-xs p-3 text-center">
+                                                <span className="mb-1 text-lg">❌</span>
+                                                <span>{scene.error}</span>
+                                            </div>
+                                        ) : (
+                                            <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-600 text-xs cursor-pointer hover:bg-slate-900/50 transition-all" onClick={() => document.getElementById(`imgUp-${index}`)?.click()} onPaste={(e) => handleSceneImagePaste(index, e)} tabIndex={0}>
+                                                <span className="text-2xl mb-1">📷</span>
+                                                <span>Click / Paste</span>
+                                            </div>
+                                        )}
+                                        <input id={`imgUp-${index}`} type="file" accept="image/*" className="hidden" onChange={(e) => handleSceneImageUpload(index, e.target.files[0])} />
+                                    </div>
+                                    <div className="p-2 space-y-1.5">
+                                        <div className="flex items-center justify-between">
+                                            <span className="text-xs font-bold text-slate-300 truncate">Scene {index + 1}</span>
+                                            <span className="text-[10px] text-slate-500">{scene.duration}s</span>
+                                        </div>
+                                        <button onClick={() => generateSceneImageSafely(index)} disabled={scene.isGenerating || isGeneratingImages} className="w-full bg-cyan-600/20 hover:bg-cyan-600/40 border border-cyan-600/30 disabled:opacity-40 text-cyan-300 rounded-lg py-1.5 text-[10px] font-semibold transition">
+                                            {scene.isGenerating ? '⏳' : scene.generatedImage ? '🔄 Regen' : scene.error ? '🔄 Retry' : '🎨 Generate'}
+                                        </button>
+                                        <div className="flex gap-1">
+                                            {scene.generatedImage && <button onClick={() => downloadImage(scene.generatedImage, `scene_${index + 1}.png`)} className="flex-1 bg-slate-800 hover:bg-slate-700 rounded-lg py-1.5 text-[10px] transition" title="Save">💾</button>}
+                                            {scene.generatedImageModel === 'nanoBanana2' && !scene.isGenerating && (
+                                                <button onClick={() => redoSceneImageWithPro(index)} className="flex-1 bg-yellow-500/10 hover:bg-yellow-500/20 border border-yellow-400/20 text-yellow-200 rounded-lg py-1.5 text-[10px] font-semibold transition" title="Redo with Pro">✨ Pro</button>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </section>
+                )}
+
+                {/* ─── STEP 4: ANIMATE ─── */}
+                {wizardStep === 4 && (
+                    <section className="grid grid-cols-1 xl:grid-cols-[300px_minmax(0,1fr)_340px] gap-5">
+                        {/* Scene list sidebar */}
+                        <aside className="studio-panel rounded-3xl p-4 h-fit xl:sticky xl:top-20">
                             <div className="rounded-2xl bg-slate-950/60 border border-slate-700/50 p-4 mb-4">
                                 <div className="flex items-center gap-3">
-                                    <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-cyan-400 to-orange-600 flex items-center justify-center">🎬</div>
+                                    <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-cyan-400 to-[#C8714F] flex items-center justify-center">🎬</div>
                                     <div className="min-w-0">
-                                        <h3 className="font-bold truncate">Current Project</h3>
-                                        <p className="text-xs text-slate-500">{scenes.length} scenes • {Math.round(totalDuration / 60)}m {totalDuration % 60}s</p>
+                                        <h3 className="font-bold truncate">Animate</h3>
+                                        <p className="text-xs text-slate-500">{scenes.length} scenes · {scenesWithVideosCount} animated</p>
                                     </div>
                                 </div>
                             </div>
 
-                            {script.trim() && (
-                                <div className="rounded-2xl bg-slate-950/60 border border-cyan-500/20 p-4 mb-4">
-                                    <h3 className="text-sm font-bold text-cyan-200 mb-2">Full Story / Script</h3>
-                                    <textarea
-                                        className="studio-prompt w-full min-h-40 max-h-64 p-3 text-xs leading-relaxed resize-y"
-                                        value={script}
-                                        onChange={(e) => setScript(e.target.value)}
-                                        onBlur={() => addLog('SUCCESS', 'Manual modification: Full Story / Script updated after scene breakdown.')}
-                                    />
-                                </div>
-                            )}
-
                             <div className="flex items-center justify-between mb-3">
                                 <h3 className="text-sm font-bold text-slate-300">Scenes</h3>
-                                <button onClick={addManualScene} className="w-8 h-8 rounded-xl bg-slate-800 hover:bg-orange-500 transition" aria-label="Add scene">+</button>
+                                <button onClick={addManualScene} className="w-8 h-8 rounded-xl bg-slate-800 hover:bg-[#C8714F] transition text-sm" aria-label="Add scene">+</button>
                             </div>
-                            <div className="space-y-2 max-h-[48vh] overflow-y-auto pr-1">
+                            <div className="space-y-2 max-h-[38vh] overflow-y-auto pr-1">
                                 {scenes.map((scene, index) => {
                                     const status = getSceneStatus(scene);
                                     const active = selectedSceneIndex === index;
                                     const selectedForAssembly = selectedAssemblySceneIndexes.includes(index);
                                     return (
-                                        <div key={index} className={`w-full rounded-2xl border p-2 transition ${active ? 'border-orange-500/70 bg-orange-500/10 shadow-lg shadow-orange-950/20' : 'border-slate-700/50 bg-slate-900/45 hover:border-slate-500/70'}`}>
+                                        <div key={index} className={`w-full rounded-2xl border p-2 transition ${active ? 'border-[#C8714F]/70 bg-[#C8714F]/10 shadow-md' : 'border-slate-700/50 bg-slate-900/45 hover:border-slate-500/70'}`}>
                                             <div className="flex gap-2">
                                                 <button onClick={() => setSelectedSceneIndex(index)} className="flex min-w-0 flex-1 gap-3 text-left">
-                                                    <div className="w-14 h-16 rounded-xl bg-slate-950 overflow-hidden flex-shrink-0">
+                                                    <div className="w-12 h-14 rounded-xl bg-slate-950 overflow-hidden flex-shrink-0">
                                                         {scene.generatedImage ? <img src={scene.generatedImage} alt="" className="w-full h-full object-cover" /> : <div className="w-full h-full flex items-center justify-center text-slate-600">🎞️</div>}
                                                     </div>
-                                                    <div className="min-w-0 flex-1">
-                                                        <div className="flex items-center justify-between gap-2">
-                                                            <p className="text-xs text-slate-500">Scene {index + 1}</p>
-                                                            <span className="text-[10px] text-slate-500">{scene.duration || 5}s</span>
-                                                        </div>
+                                                    <div className="min-w-0 flex-1 pt-1">
+                                                        <p className="text-xs text-slate-500">Scene {index + 1}</p>
                                                         <p className="text-sm font-semibold truncate">{scene.text || `Scene ${index + 1}`}</p>
                                                         <span className={`inline-flex mt-1 text-[10px] px-2 py-0.5 rounded-full border ${getStatusClasses(status)}`}>{status}</span>
                                                     </div>
                                                 </button>
-                                                <button
-                                                    onClick={() => toggleAssemblyScene(index)}
-                                                    disabled={!scene.videoUrl}
-                                                    className={`w-8 h-8 mt-4 rounded-lg border text-xs font-black transition ${selectedForAssembly ? 'bg-emerald-500 text-white border-emerald-400' : 'bg-slate-950/70 text-slate-500 border-slate-700'} disabled:opacity-30 disabled:cursor-not-allowed`}
-                                                    title={scene.videoUrl ? 'Include this scene video in selected assembly' : 'Animate this scene before selecting it for assembly'}
-                                                >
-                                                    {selectedForAssembly ? '✓' : '+'}
-                                                </button>
+                                                {scene.isGeneratingVideo ? (
+                                                    <button
+                                                        onClick={() => cancelSceneVideoGeneration(index)}
+                                                        className="w-8 h-8 mt-3 rounded-lg border border-red-500/40 bg-red-500/15 text-red-200 hover:border-red-400 transition"
+                                                        title="Cancel this scene animation"
+                                                    >
+                                                        ×
+                                                    </button>
+                                                ) : (
+                                                    <button onClick={() => toggleAssemblyScene(index)} disabled={!scene.videoUrl} className={`w-8 h-8 mt-3 rounded-lg border text-xs font-black transition ${selectedForAssembly ? 'bg-emerald-500 text-white border-emerald-400' : 'bg-slate-950/70 text-slate-500 border-slate-700'} disabled:opacity-30`} title={scene.videoUrl ? 'Select for assembly' : 'Animate first'}>
+                                                        {selectedForAssembly ? '✓' : '+'}
+                                                    </button>
+                                                )}
                                             </div>
                                         </div>
                                     );
                                 })}
                             </div>
 
-                            <div className="mt-4 rounded-2xl bg-slate-950/60 border border-slate-700/50 p-4">
-                                <div className="flex items-center justify-between mb-3">
-                                    <h3 className="text-sm font-bold text-slate-300">Character & Style Lock</h3>
-                                    <button onClick={lockCharacterFromSceneOne} disabled={!scenes[0]?.generatedImage} className="text-xs text-orange-300 disabled:text-slate-600">Lock</button>
+                            <div className="mt-4 space-y-2">
+                                <button onClick={generateAllVideos} disabled={isGeneratingVideos || scenesWithImagesCount === 0} className="w-full rounded-2xl bg-[#C8714F] hover:bg-[#B05A3A] disabled:opacity-50 py-3 text-sm font-bold transition">
+                                    {isGeneratingVideos ? '⏳ Submitting...' : '🎬 Animate All (I2V)'}
+                                </button>
+                                {isLiteVideoEngine && (
+                                    <p className="text-[11px] text-[#E8896A] bg-[#C8714F]/10 border border-[#C8714F]/30 rounded-xl px-3 py-2 text-center">Optimizing for speed: Static camera enabled.</p>
+                                )}
+                                <button onClick={() => assembleFinalVideo(selectedAssemblySceneIndexes)} disabled={isAssemblingVideo || selectedAssemblyVideosCount === 0} className="w-full rounded-2xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 py-3 text-sm font-bold transition">
+                                    {isAssemblingVideo ? '🧵 Assembling...' : `🎬 Assemble (${selectedAssemblyVideosCount})`}
+                                </button>
+                            </div>
+
+                            <div className="mt-3 rounded-2xl bg-slate-950/60 border border-slate-700/50 p-3">
+                                <div className="flex items-center justify-between mb-2">
+                                    <h3 className="text-xs font-bold text-slate-300">Character & Style Lock</h3>
+                                    <button onClick={lockCharacterFromSceneOne} disabled={!scenes[0]?.generatedImage} className="text-xs text-[#E8896A] disabled:text-slate-600">Lock</button>
                                 </div>
-                                <div className="flex items-center gap-3">
-                                    <div className="w-12 h-12 rounded-xl bg-slate-900 overflow-hidden border border-slate-700/60">
+                                <div className="flex items-center gap-2">
+                                    <div className="w-10 h-10 rounded-xl bg-slate-900 overflow-hidden border border-slate-700/60">
                                         {(referenceImage || scenes[0]?.generatedImage) ? <img src={referenceImage || scenes[0]?.generatedImage} alt="" className="w-full h-full object-cover" /> : <div className="w-full h-full flex items-center justify-center text-slate-600">👤</div>}
                                     </div>
                                     <div className="min-w-0">
-                                        <p className="text-sm font-semibold truncate">{characterDescription ? 'Main Character' : 'No character locked'}</p>
-                                        <p className="text-xs text-slate-500">{nanoBananaStyleRef ? 'Style reference active' : 'Style reference off'}</p>
+                                        <p className="text-xs font-semibold truncate">{characterDescription ? 'Main Character' : 'No character locked'}</p>
+                                        <p className="text-[10px] text-slate-500">{nanoBananaStyleRef ? 'Style ref active' : 'No style ref'}</p>
                                     </div>
                                 </div>
                             </div>
                         </aside>
 
+                        {/* Main scene viewer */}
                         <section className="space-y-5">
                             <div className="studio-panel rounded-3xl p-4 lg:p-5">
                                 <div className="flex items-center justify-between gap-3 mb-4">
                                     <div className="min-w-0">
                                         <p className="text-sm text-slate-500">Scene {selectedSceneIndex + 1}</p>
-                                        <input className="bg-transparent text-2xl font-black tracking-tight focus:outline-none focus:text-orange-200 w-full" value={selectedScene?.text || ''} onChange={(e) => updateSceneField(selectedSceneIndex, 'text', e.target.value)} />
+                                        <input className="bg-transparent text-2xl font-black tracking-tight focus:outline-none focus:text-[#E8896A] w-full" value={selectedScene?.text || ''} onChange={(e) => updateSceneField(selectedSceneIndex, 'text', e.target.value)} />
                                     </div>
                                     <div className="flex items-center gap-2">
                                         {selectedScene?.generatedImage && (
-                                            <button
-                                                onClick={() => downloadImage(selectedScene.generatedImage, `scene_${selectedSceneIndex + 1}_frame.png`)}
-                                                className="inline-flex items-center gap-2 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-200 hover:border-cyan-300 px-3 py-1.5 text-sm font-semibold transition"
-                                            >
+                                            <button onClick={() => downloadImage(selectedScene.generatedImage, `scene_${selectedSceneIndex + 1}_frame.png`)} className="inline-flex items-center gap-2 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-200 hover:border-cyan-300 px-3 py-1.5 text-sm font-semibold transition">
                                                 <Download size={16} /> Save
                                             </button>
                                         )}
@@ -2469,7 +2982,8 @@ Guidelines:
                                     </div>
                                 </div>
 
-                                <div className="relative aspect-video rounded-3xl overflow-hidden bg-slate-950 border border-slate-700/50 shadow-2xl shadow-black/30">
+                                {/* Main preview */}
+                                <div className="relative aspect-video rounded-3xl overflow-hidden bg-slate-950 border border-slate-700/50 shadow-2xl shadow-black/30 mb-4">
                                     {selectedScene?.isGenerating ? (
                                         <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-8 bg-slate-900/70">
                                             <div className="w-full max-w-sm">
@@ -2478,10 +2992,7 @@ Guidelines:
                                                     <span className="text-xs text-cyan-200">{selectedScene.imageProgress || 5}%</span>
                                                 </div>
                                                 <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
-                                                    <div
-                                                        className="bg-gradient-to-r from-cyan-500 to-pink-500 h-full transition-all duration-500"
-                                                        style={{ width: `${selectedScene.imageProgress || 5}%` }}
-                                                    ></div>
+                                                    <div className="bg-gradient-to-r from-cyan-500 to-[#C8714F] h-full transition-all duration-500" style={{ width: `${selectedScene.imageProgress || 5}%` }}></div>
                                                 </div>
                                             </div>
                                         </div>
@@ -2493,18 +3004,119 @@ Guidelines:
                                         <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-8">
                                             <div className="text-5xl mb-3">🎞️</div>
                                             <h3 className="text-xl font-bold">No frame yet</h3>
-                                            <p className="text-sm text-slate-500 mt-2">Generate an image, upload a frame, or paste one into this scene.</p>
+                                            <p className="text-sm text-slate-500 mt-2">Go back to Step 3 to generate frames first.</p>
                                         </div>
                                     )}
                                 </div>
 
-                                <div className="flex items-center gap-2 mt-4 overflow-x-auto pb-2">
+                                {/* ── First & Last Frame Slots ─────────────────────── */}
+                                <div className="rounded-2xl bg-slate-950/60 border border-slate-700/50 p-4 mb-4">
+                                    <div className="flex items-center justify-between mb-3">
+                                        <div>
+                                            <h4 className="text-sm font-bold text-slate-200">First & Last Frame</h4>
+                                            <p className="text-[11px] text-slate-500 mt-0.5">Pin frames to prevent AI drift between shots.</p>
+                                        </div>
+                                        {selectedSceneIndex > 0 && scenes[selectedSceneIndex - 1]?.videoUrl && (
+                                            <button onClick={() => captureLastVideoFrame(selectedSceneIndex - 1, selectedSceneIndex, 'start')} className="text-xs text-[#E8896A] border border-[#C8714F]/40 hover:border-[#E8896A] rounded-xl px-3 py-1.5 transition">
+                                                ⬅ Pull continuity from Scene {selectedSceneIndex}
+                                            </button>
+                                        )}
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        {/* Start Frame */}
+                                        {(['start', 'end']).map(slot => {
+                                            const slotImage = slot === 'start'
+                                                ? (selectedScene?.startFrame || selectedScene?.generatedImage)
+                                                : (selectedScene?.endFrame || (selectedSceneIndex > 0 ? scenes[selectedSceneIndex - 1]?.endFrame : null));
+                                            const isSet = slot === 'start'
+                                                ? !!selectedScene?.startFrame
+                                                : !!selectedScene?.endFrame;
+                                            return (
+                                                <div key={slot} className="space-y-2">
+                                                    <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">{slot === 'start' ? '▶ Start Frame' : '⏹ End Frame'}</p>
+                                                    <div
+                                                        className={`relative aspect-[9/16] max-h-40 w-full rounded-2xl overflow-hidden border-2 cursor-pointer transition ${isSet ? 'border-[#C8714F]/60' : 'border-dashed border-slate-600 hover:border-[#C8714F]/50'} bg-slate-900`}
+                                                        onClick={() => openAssetTray(selectedSceneIndex, slot)}
+                                                        title={`Click to assign ${slot} frame`}
+                                                    >
+                                                        {slotImage ? (
+                                                            <img src={slotImage} alt={`${slot} frame`} className="w-full h-full object-cover" />
+                                                        ) : (
+                                                            <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-600 text-xs">
+                                                                <span className="text-2xl mb-1">+</span>
+                                                                <span>Assign</span>
+                                                            </div>
+                                                        )}
+                                                        {isSet && (
+                                                            <button
+                                                                onClick={(e) => { e.stopPropagation(); updateSceneField(selectedSceneIndex, slot === 'start' ? 'startFrame' : 'endFrame', null); }}
+                                                                className="absolute top-1.5 right-1.5 w-6 h-6 rounded-full bg-red-500/80 text-white text-xs hover:bg-red-600 flex items-center justify-center"
+                                                            >×</button>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+
+                                {/* ── Asset Tray (inline drawer) ─────────────────── */}
+                                {assetTrayOpen && assetTraySceneIndex === selectedSceneIndex && (
+                                    <div className="rounded-2xl bg-[#0B1020] border border-[#C8714F]/40 p-4 mb-4 shadow-2xl">
+                                        <div className="flex items-center justify-between mb-3">
+                                            <h4 className="text-sm font-bold text-[#E8896A]">
+                                                Asset Tray — Assign {assetTraySlot === 'start' ? 'Start' : 'End'} Frame
+                                            </h4>
+                                            <button onClick={() => setAssetTrayOpen(false)} className="text-slate-500 hover:text-white text-lg leading-none">×</button>
+                                        </div>
+
+                                        <div className="space-y-4">
+                                            {/* Source 1: Step 3 gallery (all scene images) */}
+                                            <div>
+                                                <p className="text-[11px] font-semibold text-slate-400 mb-2">Step 3 Gallery</p>
+                                                <div className="flex gap-2 overflow-x-auto pb-1">
+                                                    {scenes.filter(s => s.generatedImage).map((scene, i) => (
+                                                        <button key={i} onClick={() => assignFrameSlot(assetTraySceneIndex, assetTraySlot, scene.generatedImage)} className="w-14 h-20 rounded-xl overflow-hidden border-2 border-slate-700 hover:border-[#C8714F] flex-shrink-0 transition">
+                                                            <img src={scene.generatedImage} alt="" className="w-full h-full object-cover" />
+                                                        </button>
+                                                    ))}
+                                                    {scenes.filter(s => s.generatedImage).length === 0 && (
+                                                        <p className="text-xs text-slate-600">No frames generated yet.</p>
+                                                    )}
+                                                </div>
+                                            </div>
+
+                                            {/* Source 2: Previous scene end-frame continuity */}
+                                            {assetTraySceneIndex > 0 && scenes[assetTraySceneIndex - 1]?.videoUrl && (
+                                                <div>
+                                                    <p className="text-[11px] font-semibold text-slate-400 mb-2">Continuity — Last frame of Scene {assetTraySceneIndex}</p>
+                                                    <button onClick={() => captureLastVideoFrame(assetTraySceneIndex - 1, assetTraySceneIndex, assetTraySlot)} className="rounded-xl bg-[#C8714F]/20 border border-[#C8714F]/40 hover:border-[#E8896A] px-4 py-2 text-xs font-semibold text-[#E8896A] transition">
+                                                        ⬅ Extract & Assign Last Frame
+                                                    </button>
+                                                </div>
+                                            )}
+
+                                            {/* Source 3: File upload + clipboard */}
+                                            <div className="flex gap-2 flex-wrap">
+                                                <label className="rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 px-4 py-2 text-xs font-semibold cursor-pointer transition">
+                                                    Upload File
+                                                    <input type="file" accept="image/*" className="hidden" onChange={(e) => handleFrameSlotUpload(assetTraySceneIndex, assetTraySlot, e.target.files?.[0])} />
+                                                </label>
+                                                <button onClick={() => handleFrameClipboardPaste(assetTraySceneIndex, assetTraySlot)} className="rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 px-4 py-2 text-xs font-semibold transition">
+                                                    📋 Paste from Clipboard
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                <div className="flex items-center gap-2 overflow-x-auto pb-2">
                                     {scenes.map((scene, index) => (
-                                        <button key={index} onClick={() => setSelectedSceneIndex(index)} className={`w-20 h-14 rounded-xl overflow-hidden border flex-shrink-0 ${selectedSceneIndex === index ? 'border-orange-500' : 'border-slate-700/70'}`}>
+                                        <button key={index} onClick={() => setSelectedSceneIndex(index)} className={`w-20 h-14 rounded-xl overflow-hidden border flex-shrink-0 ${selectedSceneIndex === index ? 'border-[#C8714F]' : 'border-slate-700/70'}`}>
                                             {scene.generatedImage ? <img src={scene.generatedImage} alt="" className="w-full h-full object-cover" /> : <div className="w-full h-full bg-slate-900 flex items-center justify-center text-slate-600 text-xs">{index + 1}</div>}
                                         </button>
                                     ))}
-                                    <label className="w-20 h-14 rounded-xl border border-dashed border-slate-600 flex-shrink-0 flex items-center justify-center text-slate-500 cursor-pointer hover:border-orange-500/70">
+                                    <label className="w-20 h-14 rounded-xl border border-dashed border-slate-600 flex-shrink-0 flex items-center justify-center text-slate-500 cursor-pointer hover:border-[#C8714F]/70">
                                         +
                                         <input type="file" accept="image/*" className="hidden" onChange={(e) => handleSceneImageUpload(selectedSceneIndex, e.target.files[0])} />
                                     </label>
@@ -2512,22 +3124,14 @@ Guidelines:
                             </div>
 
                             <div className="grid sm:grid-cols-2 xl:grid-cols-4 gap-3">
-                                <div className="rounded-2xl bg-orange-500 p-4 text-left transition shadow-lg shadow-orange-950/25">
+                                <div className="rounded-2xl bg-[#C8714F] p-4 text-left shadow-lg shadow-orange-950/25">
                                     <button onClick={() => generateSceneImageSafely(selectedSceneIndex)} disabled={selectedScene?.isGenerating || isGeneratingImages} className="w-full text-left disabled:opacity-50">
                                         <div className="text-2xl mb-3">✨</div>
                                         <div className="font-bold">{selectedScene?.isGenerating ? 'Generating...' : selectedScene?.generatedImage ? 'Regenerate Image' : 'Generate Image'}</div>
                                         <p className="text-xs text-orange-100/80 mt-1">Create a frame for this scene</p>
                                     </button>
-                                    {selectedScene?.isGenerating && (
-                                        <button onClick={() => cancelSceneImageGeneration(selectedSceneIndex)} className="mt-3 inline-flex items-center gap-2 rounded-xl bg-black/25 hover:bg-black/40 px-3 py-2 text-xs font-bold transition">
-                                            <XCircle size={16} /> Cancel
-                                        </button>
-                                    )}
-                                    {selectedScene?.generatedImageModel === 'nanoBanana2' && !selectedScene?.isGenerating && (
-                                        <button onClick={() => redoSceneImageWithPro(selectedSceneIndex)} className="mt-3 inline-flex items-center gap-2 rounded-xl bg-yellow-400/15 text-yellow-100 border border-yellow-300/30 hover:border-yellow-200 px-3 py-2 text-xs font-bold transition">
-                                            ✨ Redo with Pro
-                                        </button>
-                                    )}
+                                    {selectedScene?.isGenerating && <button onClick={() => cancelSceneImageGeneration(selectedSceneIndex)} className="mt-3 inline-flex items-center gap-2 rounded-xl bg-black/25 hover:bg-black/40 px-3 py-2 text-xs font-bold transition"><XCircle size={16} /> Cancel</button>}
+                                    {selectedScene?.generatedImageModel === 'nanoBanana2' && !selectedScene?.isGenerating && <button onClick={() => redoSceneImageWithPro(selectedSceneIndex)} className="mt-3 inline-flex items-center gap-2 rounded-xl bg-yellow-400/15 text-yellow-100 border border-yellow-300/30 hover:border-yellow-200 px-3 py-2 text-xs font-bold transition">✨ Redo with Pro</button>}
                                 </div>
                                 <label className="rounded-2xl bg-purple-500/15 border border-purple-500/30 hover:border-purple-400/70 p-4 text-left transition cursor-pointer">
                                     <div className="text-2xl mb-3">🖼️</div>
@@ -2541,16 +3145,10 @@ Guidelines:
                                         <div className="font-bold">{selectedScene?.isGeneratingVideo ? 'Animating...' : 'Animate Scene'}</div>
                                         <p className="text-xs text-slate-400 mt-1">Create video from frame</p>
                                     </button>
-                                    {isLiteVideoEngine && (
-                                        <p className="text-xs text-emerald-200 mt-2">Optimizing for speed: Static camera enabled.</p>
-                                    )}
-                                    {selectedScene?.isGeneratingVideo && (
-                                        <button onClick={() => cancelSceneVideoGeneration(selectedSceneIndex)} className="mt-3 inline-flex items-center gap-2 rounded-xl bg-red-500/15 text-red-200 border border-red-500/30 hover:border-red-400 px-3 py-2 text-xs font-bold transition">
-                                            <XCircle size={16} /> Cancel
-                                        </button>
-                                    )}
+                                    {isLiteVideoEngine && <p className="text-xs text-emerald-200 mt-2">Optimizing for speed: Static camera enabled.</p>}
+                                    {selectedScene?.isGeneratingVideo && <button onClick={() => cancelSceneVideoGeneration(selectedSceneIndex)} className="mt-3 inline-flex items-center gap-2 rounded-xl bg-red-500/15 text-red-200 border border-red-500/30 hover:border-red-400 px-3 py-2 text-xs font-bold transition"><XCircle size={16} /> Cancel</button>}
                                 </div>
-                                <button onClick={lockCharacterFromSceneOne} disabled={!scenes[0]?.generatedImage} className="rounded-2xl bg-slate-900/70 border border-slate-700/60 hover:border-orange-500/60 disabled:opacity-50 p-4 text-left transition">
+                                <button onClick={lockCharacterFromSceneOne} disabled={!scenes[0]?.generatedImage} className="rounded-2xl bg-slate-900/70 border border-slate-700/60 hover:border-[#C8714F]/60 disabled:opacity-50 p-4 text-left transition">
                                     <div className="text-2xl mb-3">🔒</div>
                                     <div className="font-bold">Keep Character</div>
                                     <p className="text-xs text-slate-400 mt-1">Use Scene 1 as reference</p>
@@ -2563,82 +3161,40 @@ Guidelines:
                                         <h3 className="font-black text-lg">Modify Prompts</h3>
                                         <p className="text-xs text-slate-500">Edits here are used directly by Generate and Animate.</p>
                                     </div>
-                                    <button
-                                        onClick={() => {
-                                            if (!selectedScene) return;
-                                            updateSceneField(selectedSceneIndex, 'imagePrompt', buildImagePromptForScene(selectedScene));
-                                            updateSceneField(selectedSceneIndex, 'videoPrompt', generateVideoPrompt(selectedScene));
-                                            addLog('SUCCESS', `Manual modification: Scene ${selectedSceneIndex + 1} prompts reset to AI-generated defaults.`);
-                                        }}
-                                        className="rounded-xl border border-slate-700/60 bg-slate-900/70 hover:border-cyan-500/40 px-3 py-2 text-xs font-semibold transition"
-                                    >
-                                        Reset AI Prompts
-                                    </button>
+                                    <button onClick={() => { if (!selectedScene) return; updateSceneField(selectedSceneIndex, 'imagePrompt', buildImagePromptForScene(selectedScene)); updateSceneField(selectedSceneIndex, 'videoPrompt', generateVideoPrompt(selectedScene)); addLog('SUCCESS', `Scene ${selectedSceneIndex + 1} prompts reset.`); }} className="rounded-xl border border-slate-700/60 bg-slate-900/70 hover:border-cyan-500/40 px-3 py-2 text-xs font-semibold transition">Reset AI Prompts</button>
                                 </div>
                                 <div className="grid lg:grid-cols-2 gap-4">
                                     <div>
                                         <label className="text-xs font-semibold text-cyan-200">Image Prompt</label>
-                                        <textarea
-                                            className="studio-prompt w-full mt-2 min-h-44 p-3 text-sm leading-relaxed resize-y"
-                                            value={selectedScene?.imagePrompt || ''}
-                                            placeholder="AI image prompt for this scene..."
-                                            onChange={(e) => updateScenePromptField(selectedSceneIndex, 'imagePrompt', e.target.value)}
-                                            onBlur={() => logPromptModification(selectedSceneIndex, 'image prompt')}
-                                        />
+                                        <textarea className="studio-prompt w-full mt-2 min-h-36 p-3 text-sm leading-relaxed resize-y" value={selectedScene?.imagePrompt || ''} placeholder="AI image prompt for this scene..." onChange={(e) => updateScenePromptField(selectedSceneIndex, 'imagePrompt', e.target.value)} onBlur={() => logPromptModification(selectedSceneIndex, 'image prompt')} />
                                     </div>
                                     <div>
                                         <label className="text-xs font-semibold text-cyan-200">Video Prompt</label>
-                                        <textarea
-                                            className="studio-prompt w-full mt-2 min-h-44 p-3 text-sm leading-relaxed resize-y"
-                                            value={selectedScene?.videoPrompt || ''}
-                                            placeholder="AI video prompt for this scene..."
-                                            onChange={(e) => updateScenePromptField(selectedSceneIndex, 'videoPrompt', e.target.value)}
-                                            onBlur={() => logPromptModification(selectedSceneIndex, 'video prompt')}
-                                        />
+                                        <textarea className="studio-prompt w-full mt-2 min-h-36 p-3 text-sm leading-relaxed resize-y" value={selectedScene?.videoPrompt || ''} placeholder="AI video prompt for this scene..." onChange={(e) => updateScenePromptField(selectedSceneIndex, 'videoPrompt', e.target.value)} onBlur={() => logPromptModification(selectedSceneIndex, 'video prompt')} />
                                     </div>
                                 </div>
                             </div>
                         </section>
 
+                        {/* Inspector aside */}
                         <aside className="studio-panel rounded-3xl p-4 h-fit xl:sticky xl:top-20">
                             <div className="flex rounded-2xl bg-slate-950/60 border border-slate-700/50 p-1 mb-4">
                                 {['inspector', 'prompts'].map(tab => (
-                                    <button key={tab} onClick={() => setInspectorTab(tab)} className={`flex-1 rounded-xl py-2 text-sm font-semibold transition ${inspectorTab === tab ? 'bg-orange-500 text-white' : 'text-slate-400 hover:text-white'}`}>{tab === 'inspector' ? 'Inspector' : 'Prompt Details'}</button>
+                                    <button key={tab} onClick={() => setInspectorTab(tab)} className={`flex-1 rounded-xl py-2 text-sm font-semibold transition ${inspectorTab === tab ? 'bg-[#C8714F] text-white' : 'text-slate-400 hover:text-white'}`}>{tab === 'inspector' ? 'Inspector' : 'Prompt Details'}</button>
                                 ))}
                             </div>
-
                             {inspectorTab === 'inspector' ? (
                                 <div className="space-y-4">
-                                    <div>
-                                        <label className="text-xs font-semibold text-slate-500">Scene Title</label>
-                                        <input className="studio-input w-full mt-1 p-3 text-sm" value={selectedScene?.text || ''} onChange={(e) => updateSceneField(selectedSceneIndex, 'text', e.target.value)} />
-                                    </div>
-                                    <div>
-                                        <label className="text-xs font-semibold text-slate-500">Duration</label>
-                                        <input type="number" min="3" max="15" className="studio-input w-full mt-1 p-3 text-sm" value={selectedScene?.duration || 5} onChange={(e) => updateSceneField(selectedSceneIndex, 'duration', parseInt(e.target.value) || 5)} />
-                                    </div>
-                                    <div>
-                                        <label className="text-xs font-semibold text-slate-500">Dialogue</label>
-                                        <textarea className="studio-input w-full mt-1 p-3 text-sm min-h-24" value={selectedScene?.dialogue || ''} onChange={(e) => updateSceneField(selectedSceneIndex, 'dialogue', e.target.value)} />
-                                    </div>
-                                    <div>
-                                        <label className="text-xs font-semibold text-slate-500">Visual Description</label>
-                                        <textarea className="studio-input w-full mt-1 p-3 text-sm min-h-36" value={selectedScene?.frameDescription || ''} onChange={(e) => updateSceneField(selectedSceneIndex, 'frameDescription', e.target.value)} />
-                                    </div>
+                                    <div><label className="text-xs font-semibold text-slate-500">Scene Title</label><input className="studio-input w-full mt-1 p-3 text-sm" value={selectedScene?.text || ''} onChange={(e) => updateSceneField(selectedSceneIndex, 'text', e.target.value)} /></div>
+                                    <div><label className="text-xs font-semibold text-slate-500">Duration</label><input type="number" min="3" max="15" className="studio-input w-full mt-1 p-3 text-sm" value={selectedScene?.duration || 5} onChange={(e) => updateSceneField(selectedSceneIndex, 'duration', parseInt(e.target.value) || 5)} /></div>
+                                    <div><label className="text-xs font-semibold text-slate-500">Dialogue</label><textarea className="studio-input w-full mt-1 p-3 text-sm min-h-24" value={selectedScene?.dialogue || ''} onChange={(e) => updateSceneField(selectedSceneIndex, 'dialogue', e.target.value)} /></div>
+                                    <div><label className="text-xs font-semibold text-slate-500">Visual Description</label><textarea className="studio-input w-full mt-1 p-3 text-sm min-h-32" value={selectedScene?.frameDescription || ''} onChange={(e) => updateSceneField(selectedSceneIndex, 'frameDescription', e.target.value)} /></div>
                                     <div className="grid grid-cols-2 gap-3">
                                         <select className="studio-input p-3 text-sm" value={selectedScene?.camera || 'Over-shoulder'} onChange={(e) => updateSceneField(selectedSceneIndex, 'camera', e.target.value)}>
-                                            <option>Over-shoulder</option>
-                                            <option>Close-up</option>
-                                            <option>Wide shot</option>
-                                            <option>3/4 shot</option>
-                                            <option>Macro</option>
+                                            <option>Over-shoulder</option><option>Close-up</option><option>Wide shot</option><option>3/4 shot</option><option>Macro</option>
                                         </select>
                                         <select className="studio-input p-3 text-sm" value={selectedScene?.motion || 'Static'} onChange={(e) => updateSceneField(selectedSceneIndex, 'motion', e.target.value)}>
-                                            <option>Static</option>
-                                            <option>Slow push-in</option>
-                                            <option>Pan left</option>
-                                            <option>Pan right</option>
-                                            <option>Handheld</option>
+                                            <option>Static</option><option>Slow push-in</option><option>Pan left</option><option>Pan right</option><option>Handheld</option>
                                         </select>
                                     </div>
                                     <button onClick={() => deleteScene(selectedSceneIndex)} className="text-sm text-red-300 hover:text-red-200">Delete Scene</button>
@@ -2648,7 +3204,7 @@ Guidelines:
                                     <div>
                                         <div className="flex items-center justify-between mb-2">
                                             <label className="text-xs font-semibold text-slate-500">Video Prompt</label>
-                                            <button className="text-xs text-orange-300" onClick={() => copyToClipboard(selectedScene?.videoPrompt || generateVideoPrompt(selectedScene || {}))}>Copy</button>
+                                            <button className="text-xs text-[#E8896A]" onClick={() => copyToClipboard(selectedScene?.videoPrompt || generateVideoPrompt(selectedScene || {}))}>Copy</button>
                                         </div>
                                         <div className="rounded-2xl bg-slate-950/80 border border-slate-700/60 p-3 text-xs text-slate-300 leading-relaxed max-h-64 overflow-y-auto whitespace-pre-wrap">{selectedScene ? (selectedScene.videoPrompt || generateVideoPrompt(selectedScene)) : ''}</div>
                                     </div>
@@ -2659,46 +3215,253 @@ Guidelines:
                         </aside>
                     </section>
                 )}
+
+                {/* ─── STEP 5: VOICEOVER ─── */}
+                {wizardStep === 5 && (() => {
+                    const voScene = scenes[voiceoverSceneIndex] || scenes[0];
+                    const voIdx = voiceoverSceneIndex;
+                    return (
+                        <section className="grid grid-cols-1 xl:grid-cols-[280px_minmax(0,1fr)_300px] gap-5">
+
+                            {/* ── Left: Scene Sidebar (mirrors Animate) ── */}
+                            <aside className="studio-panel rounded-3xl p-4 h-fit xl:sticky xl:top-20">
+                                <div className="rounded-2xl bg-slate-950/60 border border-slate-700/50 p-3 mb-4">
+                                    <div className="flex items-center gap-3">
+                                        <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-purple-500 to-[#C8714F] flex items-center justify-center text-xl">🎙️</div>
+                                        <div className="min-w-0">
+                                            <h3 className="font-bold text-sm truncate">Casting Desk</h3>
+                                            <p className="text-[11px] text-slate-500">{scenesWithAudioCount}/{scenes.length} voiced</p>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <h3 className="text-sm font-bold text-slate-400 mb-2">Scenes</h3>
+                                <div className="space-y-1.5 max-h-[45vh] overflow-y-auto pr-1 mb-4">
+                                    {scenes.map((scene, index) => (
+                                        <button
+                                            key={index}
+                                            onClick={() => setVoiceoverSceneIndex(index)}
+                                            className={`w-full rounded-2xl border p-3 text-left transition flex items-center gap-3 ${voiceoverSceneIndex === index ? 'border-purple-500/60 bg-purple-500/10' : 'border-slate-700/50 bg-slate-900/40 hover:border-slate-500/60'}`}
+                                        >
+                                            <div className="w-10 h-12 rounded-xl bg-slate-950 overflow-hidden flex-shrink-0">
+                                                {scene.generatedImage
+                                                    ? <img src={scene.generatedImage} alt="" className="w-full h-full object-cover" />
+                                                    : <div className="w-full h-full flex items-center justify-center text-slate-600 text-xs">🎞️</div>}
+                                            </div>
+                                            <div className="min-w-0 flex-1">
+                                                <p className="text-[10px] text-slate-500">Scene {index + 1}</p>
+                                                <p className="text-xs font-semibold truncate">{scene.text}</p>
+                                                <span className={`inline-block mt-0.5 text-[9px] px-1.5 py-0.5 rounded-full border ${scene.audioUrl ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' : 'bg-slate-800 text-slate-600 border-slate-700'}`}>
+                                                    {scene.audioUrl ? 'Audio ✓' : 'Silent'}
+                                                </span>
+                                            </div>
+                                        </button>
+                                    ))}
+                                </div>
+
+                                {/* Budget summary in sidebar */}
+                                <div className="rounded-2xl bg-slate-950/70 border border-slate-700/50 p-3">
+                                    <p className="text-[11px] font-bold text-slate-400 mb-2">Live Budget</p>
+                                    <p className="text-2xl font-black text-[#E8896A]">{liveBudget.total} <span className="text-sm font-semibold text-slate-400">pts</span></p>
+                                    <div className="mt-2 space-y-1 text-[10px] text-slate-500">
+                                        <div className="flex justify-between"><span>Images ({scenesWithImagesCount}×{PTS_COST.image})</span><span>{liveBudget.imagePts} pts</span></div>
+                                        <div className="flex justify-between"><span>Video ({scenesWithVideosCount}×{PTS_COST.video})</span><span>{liveBudget.videoPts} pts</span></div>
+                                        <div className="flex justify-between"><span>Voiceover ({scenesWithAudioCount}×{PTS_COST.voiceover})</span><span>{liveBudget.audioPts} pts</span></div>
+                                        {Object.entries(liveBudget.engineBreakdown).map(([label, pts]) => (
+                                            <div key={label} className="flex justify-between text-slate-600"><span className="truncate">{label}</span><span>{pts} pts</span></div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </aside>
+
+                            {/* ── Centre: Selected Scene Casting Desk ── */}
+                            <section className="space-y-5">
+                                {voScene ? (
+                                    <>
+                                        <div className="studio-panel rounded-3xl p-5">
+                                            <div className="flex items-center justify-between gap-3 mb-4">
+                                                <div className="min-w-0">
+                                                    <p className="text-sm text-slate-500">Scene {voIdx + 1}</p>
+                                                    <h2 className="text-xl font-black truncate">{voScene.text}</h2>
+                                                </div>
+                                                <span className={`flex-shrink-0 text-xs px-3 py-1.5 rounded-full border font-semibold ${voScene.audioUrl ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' : 'bg-slate-800 text-slate-500 border-slate-700'}`}>
+                                                    {voScene.audioUrl ? 'Audio Ready' : 'No Audio'}
+                                                </span>
+                                            </div>
+
+                                            {/* Scene preview thumbnail */}
+                                            {voScene.generatedImage && (
+                                                <div className="flex gap-4 mb-5 items-start">
+                                                    <img src={voScene.generatedImage} alt="" className="w-20 rounded-2xl border border-slate-700/60 object-cover" style={{aspectRatio:'9/16'}} />
+                                                    {voScene.videoUrl && (
+                                                        <video src={voScene.videoUrl} controls className="flex-1 rounded-2xl border border-slate-700/60 max-h-40 bg-black" />
+                                                    )}
+                                                </div>
+                                            )}
+
+                                            {/* Narrator script */}
+                                            <label className="text-xs font-semibold text-slate-400 block mb-1">Narrator Script</label>
+                                            <textarea
+                                                className="studio-input w-full p-3 text-sm min-h-28 resize-y mb-4"
+                                                placeholder="Write the narration for this scene..."
+                                                value={voScene.narratorScript ?? voScene.dialogue ?? ''}
+                                                onChange={(e) => updateSceneField(voIdx, 'narratorScript', e.target.value)}
+                                            />
+
+                                            {/* Voice selector */}
+                                            <label className="text-xs font-semibold text-slate-400 block mb-2">Voice</label>
+                                            <div className="grid grid-cols-3 gap-3 mb-4">
+                                                {VOICE_CONFIG.map(voice => {
+                                                    const active = normalizeVoiceId(voScene.voiceId) === voice.id;
+                                                    const playing = playingVoiceSample === voice.id;
+                                                    return (
+                                                        <div key={voice.id} className={`rounded-2xl border p-3 transition cursor-pointer ${active ? 'border-purple-400 bg-purple-500/15 shadow-md shadow-purple-900/20' : 'border-slate-700 bg-slate-900/60 hover:border-purple-400/50'}`} onClick={() => updateSceneField(voIdx, 'voiceId', voice.id)}>
+                                                            <div className="flex items-center justify-between gap-2 mb-1">
+                                                                <span className="text-lg">{voice.emoji}</span>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={(e) => { e.stopPropagation(); playVoiceSample(voice); }}
+                                                                    className={`w-7 h-7 rounded-lg border text-xs transition ${playing ? 'bg-purple-500/30 border-purple-400 text-purple-100' : 'bg-slate-800 border-slate-700 text-slate-300 hover:border-purple-400'}`}
+                                                                    title={`${playing ? 'Pause' : 'Play'} sample`}
+                                                                >{playing ? '❚❚' : '🔊'}</button>
+                                                            </div>
+                                                            <p className="text-sm font-black text-white">{voice.name}</p>
+                                                            <p className="text-[11px] text-slate-400">{voice.style}</p>
+                                                            {active && <span className="mt-1.5 inline-block text-[9px] bg-purple-500/20 text-purple-300 rounded-full px-2 py-0.5">Selected</span>}
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+
+                                            {/* Vibe + upload row */}
+                                            <div className="flex flex-wrap gap-3 mb-4">
+                                                <div className="flex items-center gap-2">
+                                                    <label className="text-xs font-semibold text-slate-400">Vibe</label>
+                                                    <select className="studio-input p-2 text-xs" value={voScene.voiceVibe || 'Neutral'} onChange={(e) => updateSceneField(voIdx, 'voiceVibe', e.target.value)}>
+                                                        {VIBE_OPTIONS.map(v => <option key={v} value={v}>{v}</option>)}
+                                                    </select>
+                                                </div>
+                                                <label className="rounded-xl border border-slate-700 bg-slate-900 hover:border-purple-400/50 px-3 py-2 text-xs cursor-pointer transition">
+                                                    Upload Audio Override
+                                                    <input type="file" accept="audio/*" className="hidden" onChange={(e) => handleSceneAudioUpload(voIdx, e.target.files?.[0])} />
+                                                </label>
+                                            </div>
+
+                                            {/* Generate button + audio player */}
+                                            <button onClick={() => generateNarratorAudio(voIdx)} disabled={voScene.isGeneratingAudio} className="w-full rounded-2xl bg-purple-600 hover:bg-purple-700 disabled:opacity-50 py-3 font-bold text-sm transition mb-3">
+                                                {voScene.isGeneratingAudio ? '🎙️ Generating TTS...' : 'Generate OpenAI TTS-1 Voiceover'}
+                                            </button>
+
+                                            {voScene.audioUrl && (
+                                                <div className="rounded-2xl bg-slate-950/70 border border-slate-700/50 p-3 space-y-2">
+                                                    <div className="flex items-center justify-between">
+                                                        <p className="text-xs font-semibold text-emerald-300">✓ Audio Ready · {voScene.audioSource || 'audio'}</p>
+                                                        <button onClick={() => saveAs(voScene.audioUrl, voScene.audioFileName || `scene_${voIdx + 1}_voiceover.mp3`)} className="text-xs text-slate-400 hover:text-emerald-300 transition">Download MP3</button>
+                                                    </div>
+                                                    <audio src={voScene.audioUrl} controls className="w-full h-8" />
+                                                </div>
+                                            )}
+                                        </div>
+                                    </>
+                                ) : (
+                                    <div className="studio-panel rounded-3xl p-10 text-center text-slate-500">
+                                        <p className="text-4xl mb-3">🎙️</p>
+                                        <p>No scenes yet. Go back to Story to build your project.</p>
+                                    </div>
+                                )}
+                            </section>
+
+                            {/* ── Right: Assembly & Export ── */}
+                            <aside className="space-y-4 h-fit xl:sticky xl:top-20">
+                                {finalVideoUrl && (
+                                    <div className="studio-panel rounded-3xl p-4 border border-emerald-500/30">
+                                        <h3 className="text-base font-black text-emerald-300 mb-2">🎉 Final Ready</h3>
+                                        <video src={finalVideoUrl} controls className="w-full rounded-2xl bg-black mb-3 border border-emerald-500/20" />
+                                        <button onClick={() => saveAs(finalVideoUrl, 'clay_studio_final.mp4')} className="w-full rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 font-bold py-3 text-sm transition">💾 Download Final MP4</button>
+                                    </div>
+                                )}
+
+                                <div className="studio-panel rounded-3xl p-4">
+                                    <h3 className="font-black text-base mb-3">Assemble Movie</h3>
+                                    <div className="grid grid-cols-3 gap-2 mb-3 text-center">
+                                        <div className="rounded-xl bg-slate-950/70 border border-slate-700/50 p-2"><p className="text-[10px] text-slate-500">Scenes</p><p className="text-lg font-black">{scenes.length}</p></div>
+                                        <div className="rounded-xl bg-slate-950/70 border border-slate-700/50 p-2"><p className="text-[10px] text-slate-500">Videos</p><p className="text-lg font-black text-emerald-300">{scenesWithVideosCount}</p></div>
+                                        <div className="rounded-xl bg-slate-950/70 border border-slate-700/50 p-2"><p className="text-[10px] text-slate-500">Audio</p><p className="text-lg font-black text-purple-300">{scenesWithAudioCount}</p></div>
+                                    </div>
+                                    {isAssemblingVideo && assemblyProgress && (
+                                        <p className="text-xs text-[#E8896A] mb-2">{assemblyProgress}</p>
+                                    )}
+                                    <div className="space-y-2">
+                                        <button onClick={() => assembleFinalVideo()} disabled={isAssemblingVideo || scenesWithVideosCount === 0} className="w-full rounded-2xl bg-[#C8714F] hover:bg-[#B05A3A] disabled:opacity-50 py-3 font-bold text-sm transition">
+                                            {isAssemblingVideo ? '🧵 Assembling...' : '🎬 Assemble All'}
+                                        </button>
+                                        <button onClick={() => assembleFinalVideo(selectedAssemblySceneIndexes)} disabled={isAssemblingVideo || selectedAssemblyVideosCount === 0} className="w-full rounded-2xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 py-3 font-bold text-sm transition">
+                                            {isAssemblingVideo ? '🧵 Assembling...' : `Assemble Selected (${selectedAssemblyVideosCount})`}
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div className="studio-panel rounded-3xl p-4">
+                                    <h3 className="font-black text-base mb-3">Export Assets</h3>
+                                    <div className="space-y-2">
+                                        <button onClick={downloadAllFrames} className="w-full rounded-2xl bg-slate-800 hover:bg-slate-700 border border-slate-700 py-2.5 font-semibold text-xs transition">📦 Download Frames (ZIP)</button>
+                                        <button onClick={copyAllVideoPrompts} className="w-full rounded-2xl bg-slate-800 hover:bg-slate-700 border border-slate-700 py-2.5 font-semibold text-xs transition">📋 Copy Video Prompts</button>
+                                        <button onClick={exportAllPrompts} className="w-full rounded-2xl bg-slate-800 hover:bg-slate-700 border border-slate-700 py-2.5 font-semibold text-xs transition">📄 Export Production Notes</button>
+                                    </div>
+                                </div>
+                            </aside>
+                        </section>
+                    );
+                })()}
+
             </main>
 
-            {scenes.length > 0 && (
-                <div className="fixed bottom-0 left-0 right-0 z-40 bg-[#070B14]/90 backdrop-blur-xl border-t border-slate-700/50">
-                    <div className="max-w-[1720px] mx-auto px-4 lg:px-6 py-3 flex flex-col lg:flex-row gap-3 items-stretch lg:items-center justify-between">
-                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 flex-1">
-                            <div className="rounded-2xl bg-slate-900/80 border border-slate-700/50 p-3">
-                                <p className="text-xs text-slate-500">Scenes</p>
-                                <p className="font-bold">{scenes.length} total</p>
-                            </div>
-                            <div className="rounded-2xl bg-slate-900/80 border border-slate-700/50 p-3">
-                                <p className="text-xs text-slate-500">Images</p>
-                                <p className="font-bold text-sky-300">{scenesWithImagesCount}/{scenes.length}</p>
-                            </div>
-                            <div className="rounded-2xl bg-slate-900/80 border border-slate-700/50 p-3">
-                                <p className="text-xs text-slate-500">Videos</p>
-                                <p className="font-bold text-emerald-300">{scenesWithVideosCount}/{scenes.length}</p>
-                            </div>
-                            <div className="rounded-2xl bg-slate-900/80 border border-slate-700/50 p-3">
-                                <p className="text-xs text-slate-500">Selected</p>
-                                <p className="font-bold text-orange-300 truncate">{selectedAssemblyVideosCount} videos</p>
-                            </div>
+            {/* ─── WIZARD BOTTOM NAV ─── */}
+            <div className="fixed bottom-0 left-0 right-0 z-40 bg-[#070B14]/92 backdrop-blur-xl border-t border-slate-700/50">
+                <div className="max-w-[1720px] mx-auto px-4 lg:px-6 py-3 flex items-center justify-between gap-4">
+                    <div className="hidden sm:flex items-center gap-3 text-xs text-slate-500">
+                        <span className="font-semibold text-slate-300">{scenes.length} scenes</span>
+                        <span>·</span>
+                        <span className="text-sky-400 font-semibold">{scenesWithImagesCount} frames</span>
+                        <span>·</span>
+                        <span className="text-emerald-400 font-semibold">{scenesWithVideosCount} videos</span>
+                        {finalVideoUrl && <><span>·</span><span className="text-[#E8896A] font-semibold">Final ready ✓</span></>}
+                    </div>
+                    <div className="sm:hidden text-sm font-bold text-slate-400">{WIZARD_STEPS[wizardStep - 1]}</div>
+
+                    {/* Live Budget pill */}
+                    {liveBudget.total > 0 && (
+                        <div className="hidden md:flex items-center gap-1.5 rounded-full border border-[#C8714F]/40 bg-[#C8714F]/10 px-3 py-1.5 text-xs font-semibold text-[#E8896A]" title={`Images: ${liveBudget.imagePts} pts · Video: ${liveBudget.videoPts} pts · Audio: ${liveBudget.audioPts} pts`}>
+                            💰 {liveBudget.total} pts
                         </div>
-                        <div className="flex flex-wrap gap-2 justify-end">
-                            <button onClick={nextAction.action} disabled={nextAction.disabled} className="rounded-2xl bg-orange-500 hover:bg-orange-600 disabled:opacity-50 px-5 py-3 font-bold transition">{nextAction.label}</button>
-                            <button
-                                onClick={() => assembleFinalVideo(selectedAssemblySceneIndexes)}
-                                disabled={isAssemblingVideo || selectedAssemblyVideosCount === 0}
-                                className="rounded-2xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 px-5 py-3 text-sm font-bold transition"
-                                title="Stitch only the selected completed scene videos"
-                            >
-                                {isAssemblingVideo ? 'Assembling...' : `Assemble Selected (${selectedAssemblyVideosCount})`}
+                    )}
+
+                    <div className="flex items-center gap-3 ml-auto">
+                        {wizardStep > 1 && (
+                            <button onClick={() => setWizardStep(w => w - 1)} className="rounded-2xl border border-slate-700/70 bg-slate-900/70 hover:border-slate-600 px-5 py-2.5 text-sm font-semibold transition">
+                                ← Previous
                             </button>
-                            <button onClick={downloadAllFrames} className="rounded-2xl bg-slate-800 hover:bg-slate-700 border border-slate-700 px-4 py-3 text-sm font-semibold">Export Images ZIP</button>
-                            <button onClick={() => setActivityLogOpen(true)} className="rounded-2xl bg-slate-800 hover:bg-slate-700 border border-slate-700 px-4 py-3 text-sm font-semibold">Activity Log</button>
-                        </div>
+                        )}
+                        {wizardStep < WIZARD_STEPS.length && (
+                            <button
+                                onClick={() => setWizardStep(w => w + 1)}
+                                disabled={!wizardNextEnabled}
+                                className="rounded-2xl bg-[#C8714F] hover:bg-[#B05A3A] disabled:opacity-40 px-6 py-2.5 text-sm font-bold transition"
+                                title={!wizardNextEnabled ? wizardNextHint : undefined}
+                            >
+                                Next: {WIZARD_STEPS[wizardStep]} →
+                            </button>
+                        )}
+                        {wizardStep === WIZARD_STEPS.length && finalVideoUrl && (
+                            <button onClick={() => saveAs(finalVideoUrl, 'clay_studio_final.mp4')} className="rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 px-6 py-2.5 text-sm font-bold transition">
+                                💾 Download Final
+                            </button>
+                        )}
                     </div>
                 </div>
-            )}
+            </div>
 
+            {/* Settings panel */}
             {settingsOpen && (
                 <div className="fixed inset-0 z-[70]">
                     <button className="absolute inset-0 bg-black/60" onClick={() => setSettingsOpen(false)} aria-label="Close settings"></button>
@@ -2708,9 +3471,8 @@ Guidelines:
                                 <h2 className="text-2xl font-black">Settings</h2>
                                 <p className="text-sm text-slate-500">API keys, models, and utility actions.</p>
                             </div>
-                            <button onClick={() => setSettingsOpen(false)} className="w-10 h-10 rounded-xl bg-slate-800 hover:bg-slate-700">✕</button>
+                            <button onClick={() => setSettingsOpen(false)} className="w-10 h-10 rounded-xl bg-slate-800 hover:bg-slate-700 flex items-center justify-center">✕</button>
                         </div>
-
                         <div className="space-y-6">
                             <section className="studio-panel rounded-2xl p-4">
                                 <h3 className="font-bold mb-4">API Keys</h3>
@@ -2750,8 +3512,39 @@ Guidelines:
                                     </select>
                                     <select className="studio-input p-3 text-sm" value={videoAudio ? 'on' : 'off'} onChange={(e) => setVideoAudio(e.target.value === 'on')}>
                                         <option value="off">Audio Off</option>
-                                        <option value="on">Audio On</option>
+                                        <option value="on">Audio On (w/ Dialogue)</option>
                                     </select>
+                                    <select className="studio-input p-3 text-sm sm:col-span-2" value={videoPromptEngine} onChange={(e) => setVideoPromptEngine(e.target.value)}>
+                                        <option value="kling">Kling Prompt Format</option>
+                                        <option value="veo">Veo Prompt Format</option>
+                                    </select>
+                                </div>
+                            </section>
+
+                            <section className="studio-panel rounded-2xl p-4">
+                                <div className="flex items-center justify-between mb-3">
+                                    <h3 className="font-bold">Activity Log</h3>
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-xs text-slate-500">{logs.length}/200 events</span>
+                                        <button onClick={() => setLogs([])} className="text-xs text-slate-500 hover:text-red-400 transition px-2 py-1 rounded-lg border border-slate-700 hover:border-red-500/50">Clear</button>
+                                    </div>
+                                </div>
+                                <div className="h-48 overflow-y-auto rounded-xl bg-slate-950/60 border border-slate-700/50 p-2 space-y-1 text-[10px] font-mono">
+                                    {logs.length === 0 ? (
+                                        <p className="text-slate-600 text-center py-4">No events yet. Generate a scene to see activity.</p>
+                                    ) : (
+                                        [...logs].reverse().map((log, i) => (
+                                            <div key={i} className="flex gap-2 items-start leading-relaxed">
+                                                <span className={`shrink-0 font-bold uppercase ${
+                                                    log.type === 'ERROR' ? 'text-red-400' :
+                                                    log.type === 'SUCCESS' ? 'text-emerald-400' :
+                                                    log.type === 'API_CALL' ? 'text-cyan-400' :
+                                                    'text-slate-500'
+                                                }`}>{log.type}</span>
+                                                <span className="text-slate-400 break-all">{log.message}</span>
+                                            </div>
+                                        ))
+                                    )}
                                 </div>
                             </section>
 
@@ -2768,6 +3561,7 @@ Guidelines:
                 </div>
             )}
 
+            {/* Activity log panel */}
             {activityLogOpen && (
                 <div className="fixed inset-0 z-[70]">
                     <button className="absolute inset-0 bg-black/60" onClick={() => setActivityLogOpen(false)} aria-label="Close activity log"></button>
@@ -2777,11 +3571,11 @@ Guidelines:
                                 <h2 className="text-2xl font-black">Activity Log</h2>
                                 <p className="text-sm text-slate-500">{logs.length}/200 events</p>
                             </div>
-                            <button onClick={() => setActivityLogOpen(false)} className="w-10 h-10 rounded-xl bg-slate-800 hover:bg-slate-700">✕</button>
+                            <button onClick={() => setActivityLogOpen(false)} className="w-10 h-10 rounded-xl bg-slate-800 hover:bg-slate-700 flex items-center justify-center">✕</button>
                         </div>
                         <div className="flex flex-wrap gap-2 mb-4">
                             {['ALL', 'SUCCESS', 'ERROR', 'POLLING', 'FFMPEG', 'API_CALL'].map(type => (
-                                <button key={type} onClick={() => setLogFilter(type)} className={`rounded-full px-3 py-1.5 text-xs font-semibold border ${logFilter === type ? 'bg-orange-500 text-white border-orange-500' : 'bg-slate-900 text-slate-400 border-slate-700'}`}>{type}</button>
+                                <button key={type} onClick={() => setLogFilter(type)} className={`rounded-full px-3 py-1.5 text-xs font-semibold border ${logFilter === type ? 'bg-[#C8714F] text-white border-[#C8714F]' : 'bg-slate-900 text-slate-400 border-slate-700'}`}>{type}</button>
                             ))}
                         </div>
                         <div className="flex gap-2 mb-4">
@@ -2798,986 +3592,6 @@ Guidelines:
                     </aside>
                 </div>
             )}
-        </div>
-    );
-
-    return (
-        <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 text-white p-6">
-            <style>{`
-                @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600;700&display=swap');
-                
-                * {
-                    font-family: 'Inter', sans-serif;
-                }
-                
-                .mono {
-                    font-family: 'Space Mono', monospace;
-                }
-            `}</style>
-
-            {/* Header */}
-            <div className="max-w-7xl mx-auto mb-8 text-center">
-                <div className="h-1 w-24 bg-gradient-to-r from-pink-500 to-cyan-500 mx-auto mb-4 rounded-full"></div>
-                <h1 className="mono text-5xl font-bold bg-gradient-to-r from-pink-400 via-purple-400 to-cyan-400 bg-clip-text text-transparent mb-2">
-                    CLAYMATION STUDIO PRO
-                </h1>
-                <p className="text-slate-400 text-lg">Kie.ai Unified Platform • Parallel I2V • Real-Time Progress • 3s Polling • Multimodal AI</p>
-            </div>
-
-            {isAssemblingVideo && (
-                <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-6">
-                    <div className="bg-slate-900 border border-emerald-500/50 rounded-2xl p-8 max-w-md w-full text-center shadow-2xl shadow-emerald-500/20">
-                        <div className="w-14 h-14 border-4 border-slate-700 border-t-emerald-400 rounded-full animate-spin mx-auto mb-4"></div>
-                        <h2 className="mono text-2xl font-bold text-emerald-400 mb-2">Stitching Final Movie</h2>
-                        <p className="text-slate-300 text-sm">{assemblyProgress || 'Preparing final master...'}</p>
-                        <p className="text-xs text-slate-500 mt-3">Please keep this tab open while FFmpeg assembles your scenes.</p>
-                    </div>
-                </div>
-            )}
-
-            {/* AI Settings */}
-            <div className="max-w-7xl mx-auto mb-6">
-                <div className="bg-slate-800/50 backdrop-blur border border-slate-700 rounded-2xl p-6">
-                    <div className="flex justify-between items-center mb-4">
-                        <h2 className="mono text-xl font-bold text-cyan-400">⚙️ AI Settings</h2>
-                        <div className="flex gap-2">
-                            {copyFeedback && (
-                                <span className="text-sm text-green-400 flex items-center gap-1 animate-pulse">
-                                    ✓ {copyFeedback}
-                                </span>
-                            )}
-                            <button 
-                                className="text-sm text-cyan-400 hover:text-cyan-300 transition-colors"
-                                onClick={() => {
-                                    if (confirm('Reset video settings to default? This will clear engine selection, resolution, and audio settings.')) {
-                                        localStorage.removeItem('activeVideoEngine');
-                                        localStorage.removeItem('videoResolution');
-                                        localStorage.removeItem('videoAudio');
-                                        window.location.reload();
-                                    }
-                                }}
-                            >
-                                🔄 Reset Settings
-                            </button>
-                            <button 
-                                className="text-sm text-orange-400 hover:text-orange-300 transition-colors"
-                                onClick={clearAllKeys}
-                            >
-                                🔑 Clear Keys
-                            </button>
-                            <button 
-                                className="text-sm text-red-400 hover:text-red-300 transition-colors"
-                                onClick={resetStudio}
-                            >
-                                🗑️ Reset Studio
-                            </button>
-                        </div>
-                    </div>
-                    
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                        {/* API Keys - Row 1 */}
-                        <div>
-                            <label className="block text-sm font-semibold mb-2 text-slate-300">OpenAI API Key</label>
-                            <input
-                                type="password"
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-cyan-500"
-                                placeholder="sk-..."
-                                value={openAIKey}
-                                onChange={(e) => setOpenAIKey(e.target.value)}
-                            />
-                        </div>
-                        <div>
-                            <label className="block text-sm font-semibold mb-2 text-slate-300">Anthropic API Key</label>
-                            <input
-                                type="password"
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-cyan-500"
-                                placeholder="sk-ant-..."
-                                value={anthropicKey}
-                                onChange={(e) => setAnthropicKey(e.target.value)}
-                            />
-                        </div>
-                        <div>
-                            <label className="block text-sm font-semibold mb-2 text-slate-300">Gemini API Key</label>
-                            <input
-                                type="password"
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-cyan-500"
-                                placeholder="AIza..."
-                                value={geminiKey}
-                                onChange={(e) => setGeminiKey(e.target.value)}
-                            />
-                        </div>
-
-                        {/* Video API Keys - Row 2 */}
-                        <div className="md:col-span-2">
-                            <label className="block text-sm font-semibold mb-2 text-pink-400">Kie.ai API Key (Unified Video Platform)</label>
-                            <input
-                                type="password"
-                                className="w-full bg-slate-900 border border-pink-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-pink-500"
-                                placeholder="2edf9c1f2454e5b6e8e5bdbae5690ad1"
-                                value={kieAiKey}
-                                onChange={(e) => setKieAiKey(e.target.value)}
-                            />
-                            <p className="text-xs text-slate-500 mt-1">Provides access to Veo 3.1 Lite/Fast/Standard and Kling 3.0 Standard/Pro/4K.</p>
-                        </div>
-                        <div className="flex items-end">
-                            <div className="w-full bg-slate-800 border border-slate-600 rounded-lg p-2 text-center">
-                                <div className="text-xs text-slate-400">Estimated Cost</div>
-                                <div className="text-lg font-bold text-yellow-400">{estimatedCost.toFixed(1)} pts</div>
-                                <div className="text-xs text-slate-500">{scenes.length} scenes</div>
-                            </div>
-                        </div>
-
-                        {/* Model Selection */}
-                        <div>
-                            <label className="block text-sm font-semibold mb-2 text-cyan-400">Text Provider</label>
-                            <select
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-cyan-500"
-                                value={activeTextProvider}
-                                onChange={(e) => setActiveTextProvider(e.target.value)}
-                            >
-                                <option value="openai">OpenAI (gpt-4o)</option>
-                                <option value="anthropic">Anthropic (claude-sonnet-4-5)</option>
-                                <option value="gemini">Gemini (gemini-1.5-pro)</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label className="block text-sm font-semibold mb-2 text-cyan-400">Image Model</label>
-                            <select
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-cyan-500"
-                                value={activeImageModel}
-                                onChange={(e) => setActiveImageModel(e.target.value)}
-                            >
-                                <option value="nanoBanana2">NanoBanana 2 (Flash - Fastest)</option>
-                                <option value="nanoBananaPro">NanoBanana Pro (High Quality)</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label className="block text-sm font-semibold mb-2 text-pink-400">Video Engine (Kie.ai)</label>
-                            <select
-                                className="w-full bg-slate-900 border border-pink-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-pink-500"
-                                value={activeVideoEngine}
-                                onChange={(e) => {
-                                    setActiveVideoEngine(e.target.value);
-                                    console.log('🔄 Video engine changed to:', e.target.value);
-                                }}
-                            >
-                                <optgroup label="Google Veo 3.1">
-                                    <option value="veo-3.1-lite">🌱 Veo 3.1 Lite (veo3_lite • ~0.4 pts/sec)</option>
-                                    <option value="veo-3.1-fast">🚀 Veo 3.1 Fast (veo3_fast • ~0.6 pts/sec)</option>
-                                    <option value="veo-3.1-standard">🎬 Veo 3.1 Standard / Quality (veo3 • ~1.5 pts/sec)</option>
-                                </optgroup>
-                                <optgroup label="Kling 3.0">
-                                    <option value="kling-3.0-standard">⚡ Kling 3.0 Standard (std • ~0.4 pts/sec)</option>
-                                    <option value="kling-3.0-pro">💎 Kling 3.0 Pro (pro • ~0.8 pts/sec)</option>
-                                    <option value="kling-3.0-4k">🖥️ Kling 3.0 4K (4K • ~1.6 pts/sec)</option>
-                                </optgroup>
-                            </select>
-                            <p className="text-xs text-slate-500 mt-1">
-                                Currently selected: <span className="text-pink-400 font-semibold">
-                                    {(VIDEO_MODEL_CONFIGS[activeVideoEngine] || VIDEO_MODEL_CONFIGS['veo-3.1-fast']).label}
-                                </span>
-                            </p>
-                        </div>
-
-                        {/* Video Settings */}
-                        <div>
-                            <label className="block text-sm font-semibold mb-2 text-pink-400">Resolution</label>
-                            <select
-                                className="w-full bg-slate-900 border border-pink-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-pink-500"
-                                value={videoResolution}
-                                onChange={(e) => setVideoResolution(e.target.value)}
-                            >
-                                <option value="720p">720p (Faster)</option>
-                                <option value="1080p">1080p (High Quality)</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label className="block text-sm font-semibold mb-2 text-pink-400">Audio</label>
-                            <div className="flex items-center gap-4 h-[42px]">
-                                <label className="flex items-center gap-2 cursor-pointer">
-                                    <input 
-                                        type="radio" 
-                                        name="audio"
-                                        className="w-4 h-4 accent-pink-500"
-                                        checked={videoAudio === false}
-                                        onChange={() => setVideoAudio(false)}
-                                    />
-                                    <span className="text-sm">OFF</span>
-                                </label>
-                                <label className="flex items-center gap-2 cursor-pointer">
-                                    <input 
-                                        type="radio" 
-                                        name="audio"
-                                        className="w-4 h-4 accent-pink-500"
-                                        checked={videoAudio === true}
-                                        onChange={() => setVideoAudio(true)}
-                                    />
-                                    <span className="text-sm">ON (w/ Dialogue)</span>
-                                </label>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-6">
-                {/* Step 1: Script Input */}
-                <div className="bg-slate-800/50 backdrop-blur border border-slate-700 rounded-2xl p-6">
-                    <div className="flex items-center gap-3 mb-4">
-                        <span className="flex items-center justify-center w-8 h-8 bg-pink-500 rounded-full text-sm font-bold">1</span>
-                        <h2 className="mono text-xl font-bold text-cyan-400">Script & Setup</h2>
-                    </div>
-                    
-                    {/* Reference Image Upload */}
-                    <div className="mb-4">
-                        <label className="block text-sm font-semibold mb-2 text-slate-300">🖼️ Reference Image (Optional)</label>
-                        <div 
-                            className="border-2 border-dashed border-slate-600 rounded-lg p-4 text-center cursor-pointer hover:border-cyan-500 transition-all"
-                            onDrop={handleImageDrop}
-                            onDragOver={(e) => e.preventDefault()}
-                            onPaste={handleImagePaste}
-                            onClick={() => document.getElementById('imageUpload').click()}
-                        >
-                            {referenceImage ? (
-                                <div className="relative">
-                                    <img src={referenceImage} alt="Reference" className="max-h-40 mx-auto rounded" />
-                                    <button 
-                                        className="absolute top-0 right-0 bg-red-500 text-white rounded-full w-6 h-6 text-xs"
-                                        onClick={(e) => { e.stopPropagation(); setReferenceImage(null); }}
-                                    >
-                                        ✕
-                                    </button>
-                                </div>
-                            ) : (
-                                <p className="text-slate-400 text-sm">
-                                    📷 Click, drag & drop, or paste (Ctrl+V) an image
-                                </p>
-                            )}
-                        </div>
-                        <input 
-                            id="imageUpload"
-                            type="file" 
-                            accept="image/*" 
-                            className="hidden" 
-                            onChange={handleImageUpload}
-                        />
-                        
-                        {/* Vision Toggles */}
-                        {referenceImage && (
-                            <div className="mt-3 space-y-2">
-                                <div className="flex items-center gap-2">
-                                    <input 
-                                        type="checkbox" 
-                                        id="visionGuided" 
-                                        className="w-4 h-4 accent-cyan-500"
-                                        checked={visionGuidedBreakdown}
-                                        onChange={(e) => setVisionGuidedBreakdown(e.target.checked)}
-                                    />
-                                    <label htmlFor="visionGuided" className="text-sm font-medium text-cyan-400">
-                                        👁️ Vision-Guided Breakdown
-                                    </label>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                    <input 
-                                        type="checkbox" 
-                                        id="nanoBananaStyle" 
-                                        className="w-4 h-4 accent-pink-500"
-                                        checked={nanoBananaStyleRef}
-                                        onChange={(e) => setNanoBananaStyleRef(e.target.checked)}
-                                    />
-                                    <label htmlFor="nanoBananaStyle" className="text-sm font-medium text-pink-400">
-                                        🎨 NanoBanana Style Reference
-                                    </label>
-                                </div>
-                            </div>
-                        )}
-                    </div>
-
-                    <div className="flex items-center gap-2 mb-4">
-                        <input 
-                            type="checkbox" 
-                            id="hasCharacter" 
-                            className="w-4 h-4 accent-pink-500"
-                            checked={hasCharacter}
-                            onChange={(e) => setHasCharacter(e.target.checked)}
-                        />
-                        <label htmlFor="hasCharacter" className="text-sm font-medium">
-                            I have a character reference
-                        </label>
-                    </div>
-
-                    {hasCharacter && (
-                        <div className="mb-4">
-                            <label className="block text-sm font-semibold mb-2 text-slate-300">Character Description</label>
-                            <textarea
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:outline-none focus:border-cyan-500"
-                                rows="3"
-                                placeholder="Describe your clay character..."
-                                value={characterDescription}
-                                onChange={(e) => setCharacterDescription(e.target.value)}
-                            />
-                        </div>
-                    )}
-
-                    <div className="mb-4">
-                        <label className="block text-sm font-semibold mb-2 text-slate-300">Video Script</label>
-                        <textarea
-                            className="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:outline-none focus:border-cyan-500"
-                            rows="8"
-                            placeholder="Enter your script here..."
-                            value={script}
-                            onChange={(e) => setScript(e.target.value)}
-                        />
-                    </div>
-
-                    <button 
-                        className="w-full bg-gradient-to-r from-pink-500 to-pink-600 hover:from-pink-600 hover:to-pink-700 text-white font-bold py-3 px-6 rounded-lg mono text-sm uppercase tracking-wide transition-all hover:scale-105 disabled:opacity-50"
-                        onClick={generateSceneDescriptions}
-                        disabled={isGenerating || !script.trim()}
-                    >
-                        {isGenerating ? '⏳ GENERATING...' : '🎬 GENERATE SCENE BREAKDOWN'}
-                    </button>
-                </div>
-
-                {/* Step 2: Scene Breakdown */}
-                <div className="bg-slate-800/50 backdrop-blur border border-slate-700 rounded-2xl p-6">
-                    <div className="flex items-center gap-3 mb-4">
-                        <span className="flex items-center justify-center w-8 h-8 bg-pink-500 rounded-full text-sm font-bold">2</span>
-                        <h2 className="mono text-xl font-bold text-cyan-400">Scene Breakdown</h2>
-                    </div>
-
-                    {isGenerating && (
-                        <div className="text-center py-12">
-                            <div className="inline-block w-12 h-12 border-4 border-slate-700 border-t-cyan-500 rounded-full animate-spin mb-4"></div>
-                            <p className="text-slate-400">Analyzing script with {activeTextProvider.toUpperCase()}...</p>
-                        </div>
-                    )}
-
-                    {!isGenerating && scenes.length === 0 && (
-                        <div className="space-y-4">
-                            <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4 text-sm">
-                                ⚠️ No scenes yet. Generate from script above OR manually add scenes below to paste images directly.
-                            </div>
-                            <button 
-                                className="w-full bg-gradient-to-r from-purple-500 to-purple-600 hover:from-purple-600 hover:to-purple-700 text-white font-bold py-3 px-6 rounded-lg text-sm transition-all hover:scale-105"
-                                onClick={() => {
-                                    const newScene = {
-                                        text: 'Manual Scene 1',
-                                        dialogue: '',
-                                        duration: 5,
-                                        frameDescription: 'Describe your scene here...',
-                                        generatedImage: null,
-                                        isGenerating: false,
-                                        error: null,
-                                        videoPrompt: '',
-                                        isManualUpload: false,
-                                        videoUrl: null,
-                                        videoTaskId: null,
-                                        videoProgress: 0,
-                                        videoStatus: 'pending',
-                                        isGeneratingVideo: false
-                                    };
-                                    setScenes([newScene]);
-                                }}
-                            >
-                                ➕ Add Manual Scene (Paste Image Workflow)
-                            </button>
-                        </div>
-                    )}
-
-                    {!isGenerating && scenes.length > 0 && (
-                        <>
-                            <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-4 mb-4 text-sm flex justify-between items-center">
-                                <span>✅ {scenes.length} scene{scenes.length !== 1 ? 's' : ''}</span>
-                                <div className="flex gap-2">
-                                    <button 
-                                        className="text-xs bg-purple-600 hover:bg-purple-700 px-3 py-1 rounded text-white font-semibold"
-                                        onClick={() => {
-                                            const newScene = {
-                                                text: `Scene ${scenes.length + 1}`,
-                                                dialogue: '',
-                                                duration: 5,
-                                                frameDescription: 'Describe your scene...',
-                                                generatedImage: null,
-                                                isGenerating: false,
-                                                error: null,
-                                                videoPrompt: '',
-                                                isManualUpload: false,
-                                                videoUrl: null,
-                                                videoTaskId: null,
-                                                videoProgress: 0,
-                                                videoStatus: 'pending',
-                                                isGeneratingVideo: false
-                                            };
-                                            setScenes([...scenes, newScene]);
-                                        }}
-                                    >
-                                        ➕ Add Scene
-                                    </button>
-                                    <button 
-                                        className="text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded"
-                                        onClick={copyAllSceneData}
-                                    >
-                                        📋 Copy All
-                                    </button>
-                                    <button 
-                                        className="text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded"
-                                        onClick={exportAllPrompts}
-                                    >
-                                        📄 Export
-                                    </button>
-                                </div>
-                            </div>
-                            
-                            <div className="space-y-3 max-h-[500px] overflow-y-auto pr-2">
-                                {scenes.map((scene, index) => (
-                                    <div key={index} className="bg-slate-900 border border-slate-700 rounded-lg p-4 hover:border-purple-500/30 transition-all">
-                                        <div className="flex justify-between items-center mb-2">
-                                            <input 
-                                                type="text"
-                                                className="mono text-sm font-bold text-yellow-400 bg-slate-800 border border-slate-700 focus:outline-none focus:ring-1 focus:ring-yellow-400 rounded px-2 py-1 flex-1 mr-2"
-                                                value={scene.text}
-                                                onChange={(e) => {
-                                                    const updated = [...scenes];
-                                                    updated[index].text = e.target.value;
-                                                    setScenes(updated);
-                                                }}
-                                                placeholder="Scene title"
-                                            />
-                                            <div className="flex items-center gap-2">
-                                                <input 
-                                                    type="number"
-                                                    className="text-xs bg-slate-800 border border-slate-700 px-2 py-1 rounded w-14 text-center focus:ring-1 focus:ring-purple-500"
-                                                    value={scene.duration}
-                                                    onChange={(e) => {
-                                                        const updated = [...scenes];
-                                                        updated[index].duration = parseInt(e.target.value) || 5;
-                                                        setScenes(updated);
-                                                    }}
-                                                    min="3"
-                                                    max="9"
-                                                />
-                                                <span className="text-xs text-slate-400">s</span>
-                                                <button 
-                                                    className="text-red-400 hover:text-red-300 text-sm p-1"
-                                                    onClick={() => {
-                                                        if (confirm('Delete this scene?')) {
-                                                            setScenes(scenes.filter((_, i) => i !== index));
-                                                        }
-                                                    }}
-                                                    title="Delete scene"
-                                                >
-                                                    🗑️
-                                                </button>
-                                            </div>
-                                        </div>
-                                        
-                                        <textarea
-                                            className="w-full text-xs bg-slate-800 border border-slate-700 p-2 rounded border-l-2 border-l-pink-500 mb-2 text-white focus:outline-none focus:ring-1 focus:ring-pink-500 font-mono"
-                                            rows="3"
-                                            value={scene.frameDescription}
-                                            onChange={(e) => {
-                                                const updated = [...scenes];
-                                                updated[index].frameDescription = e.target.value;
-                                                setScenes(updated);
-                                            }}
-                                            placeholder="Visual description..."
-                                        />
-                                        
-                                        <input 
-                                            type="text"
-                                            className="w-full text-xs bg-purple-500/10 border border-purple-500/30 rounded p-2 text-white placeholder-purple-300/50 focus:outline-none focus:ring-1 focus:ring-purple-500"
-                                            value={scene.dialogue || ''}
-                                            onChange={(e) => {
-                                                const updated = [...scenes];
-                                                updated[index].dialogue = e.target.value;
-                                                setScenes(updated);
-                                            }}
-                                            placeholder="💬 Dialogue/Script (optional)"
-                                        />
-                                    </div>
-                                ))}
-                            </div>
-                        </>
-                    )}
-                </div>
-            </div>
-
-            {/* Step 3: NanoBanana Image Generation */}
-            {scenes.length > 0 && (
-                <div className="max-w-7xl mx-auto mt-6">
-                    <div className="bg-slate-800/50 backdrop-blur border border-slate-700 rounded-2xl p-6">
-                            <div className="flex items-center justify-between mb-4">
-                            <div className="flex items-center gap-3">
-                                <span className="flex items-center justify-center w-8 h-8 bg-pink-500 rounded-full text-sm font-bold">3</span>
-                                <h2 className="mono text-xl font-bold text-cyan-400">🎨 Frame Generation</h2>
-                            </div>
-                            <div className="flex gap-2">
-                                <button 
-                                    className="bg-gradient-to-r from-cyan-500 to-cyan-600 hover:from-cyan-600 hover:to-cyan-700 text-white font-bold py-2 px-4 rounded-lg text-sm transition-all disabled:opacity-50"
-                                    onClick={generateAllImages}
-                                    disabled={isGeneratingImages}
-                                    title={`Uses ${activeImageModel === 'nanoBanana2' ? 'NanoBanana 2 (Fast)' : 'NanoBanana Pro'} • Processes pending images in parallel`}
-                                >
-                                    {isGeneratingImages ? '⏳ Generating...' : '🚀 Generate All Frames'}
-                                </button>
-                                <button
-                                    className="bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700 text-white font-bold py-2 px-4 rounded-lg text-sm transition-all disabled:opacity-50"
-                                    onClick={lockCharacterFromSceneOne}
-                                    disabled={!scenes[0]?.generatedImage || isGeneratingImages}
-                                    title="Use Scene 1 frame as the character/style reference for later frame generation"
-                                >
-                                    🔒 Keep Character From Scene 1
-                                </button>
-                                {scenes.some(s => s.generatedImage) && (
-                                    <>
-                                        <button 
-                                            className="bg-gradient-to-r from-pink-500 to-pink-600 hover:from-pink-600 hover:to-pink-700 text-white font-bold py-2 px-4 rounded-lg text-sm transition-all disabled:opacity-50"
-                                            onClick={generateAllVideos}
-                                            disabled={isGeneratingVideos}
-                                            title="Submit all videos in parallel • Real-time progress tracking"
-                                        >
-                                            {isGeneratingVideos ? '⏳ Submitting...' : '🎬 Animate All (I2V)'}
-                                        </button>
-                                        {isLiteVideoEngine && (
-                                            <p className="self-center text-xs text-pink-200 bg-pink-500/10 border border-pink-500/30 rounded-lg px-3 py-2">
-                                                Optimizing for speed: Static camera enabled.
-                                            </p>
-                                        )}
-                                        <button 
-                                            className="bg-gradient-to-r from-emerald-500 via-yellow-500 to-amber-500 hover:from-emerald-600 hover:via-yellow-600 hover:to-amber-600 text-white font-bold py-2 px-4 rounded-lg text-sm transition-all disabled:opacity-50"
-                                            onClick={assembleFinalVideo}
-                                            disabled={isAssemblingVideo || !scenes.some(s => s.videoUrl)}
-                                            title="Stitch all completed scene videos into one MP4 master"
-                                        >
-                                            {isAssemblingVideo ? '🧵 Assembling...' : '🎬 Assemble Final Movie'}
-                                        </button>
-                                        <button 
-                                            className="bg-slate-700 hover:bg-slate-600 text-white font-bold py-2 px-4 rounded-lg text-sm transition-all"
-                                            onClick={downloadAllFrames}
-                                        >
-                                            📦 Download All (.zip)
-                                        </button>
-                                    </>
-                                )}
-                            </div>
-                        </div>
-
-                        {isGeneratingImages && (
-                            <div className="bg-cyan-500/10 border border-cyan-500/30 rounded-lg p-3 mb-4">
-                                <div className="flex items-center justify-between mb-2">
-                                    <span className="text-sm">
-                                        {activeImageModel === 'nanoBanana2' ? '⚡ Fast-track generation in progress...' : '⏳ Crafting high-fidelity frames...'}
-                                    </span>
-                                    <span className="text-sm font-bold text-cyan-400">
-                                        {generationProgress.completed}/{generationProgress.total} Complete
-                                    </span>
-                                </div>
-                                {/* Progress Bar */}
-                                <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
-                                    <div 
-                                        className="bg-gradient-to-r from-cyan-500 to-pink-500 h-full transition-all duration-500 ease-out"
-                                        style={{ width: `${(generationProgress.completed / generationProgress.total) * 100}%` }}
-                                    ></div>
-                                </div>
-                                <p className="text-xs text-slate-400 mt-2">
-                                    ⚡ Parallel generation • NanoBanana 2 runs up to 4 frames at once • Timeout-protected requests
-                                </p>
-                            </div>
-                        )}
-                        
-                        {!isGeneratingImages && scenes.length > 0 && !scenes.some(s => s.generatedImage) && (
-                            <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg p-3 mb-4 text-sm">
-                                💡 <strong>Pro Tip:</strong> Generate frames in parallel (3 at a time) then click "Animate All (I2V)" for concurrent video generation with real-time progress!
-                            </div>
-                        )}
-                        
-                        {scenes.some(s => s.generatedImage) && !scenes.some(s => s.videoUrl) && (
-                            <div className="bg-pink-500/10 border border-pink-500/30 rounded-lg p-3 mb-4 text-sm">
-                                🎬 <strong>Ready for Animation:</strong> Click "Animate All" for parallel I2V processing via Kie.ai • Estimated time: 15-60s per video • Real-time progress tracking
-                            </div>
-                        )}
-
-                        {finalVideoUrl && (
-                            <div className="bg-emerald-500/10 border border-emerald-500/40 rounded-xl p-4 mb-4">
-                                <div className="flex items-center justify-between gap-4 mb-3 flex-wrap">
-                                    <div>
-                                        <h3 className="mono text-lg font-bold text-emerald-400">Final Master Video Ready</h3>
-                                        <p className="text-xs text-slate-400">Your stitched claymation movie is available for preview and download.</p>
-                                    </div>
-                                    <button
-                                        className="bg-gradient-to-r from-emerald-500 to-yellow-500 hover:from-emerald-600 hover:to-yellow-600 text-white font-bold py-2 px-4 rounded-lg text-sm transition-all"
-                                        onClick={() => saveAs(finalVideoUrl, 'claymation_final.mp4')}
-                                    >
-                                        💾 Download Final Master
-                                    </button>
-                                </div>
-                                <video src={finalVideoUrl} controls className="w-full max-h-[420px] rounded-lg bg-black border border-emerald-500/30" />
-                            </div>
-                        )}
-
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                            {scenes.map((scene, index) => (
-                                <div key={index} className="bg-slate-900 border border-slate-700 rounded-lg p-4 hover:border-cyan-500/50 transition-all">
-                                    <div className="flex justify-between items-center mb-3">
-                                        <span className="mono text-sm font-bold text-yellow-400">Scene {index + 1}</span>
-                                        <div className="flex items-center gap-2">
-                                            <span className="text-xs text-slate-400">{scene.duration}s</span>
-                                            {scene.isGenerating && (
-                                                <span className="text-xs bg-cyan-500/20 text-cyan-400 px-2 py-0.5 rounded-full animate-pulse">
-                                                    Processing
-                                                </span>
-                                            )}
-                                        </div>
-                                    </div>
-                                    
-                                    {/* 9:16 Preview Container with manual upload */}
-                                    <div className="relative bg-slate-950 rounded-lg overflow-hidden mb-3" style={{ aspectRatio: '9/16' }}>
-                                        {scene.isGenerating ? (
-                                            <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900/50">
-                                                <div className="w-8 h-8 border-4 border-slate-700 border-t-cyan-500 rounded-full animate-spin mb-2"></div>
-                                                <span className="text-xs text-cyan-400 font-semibold">{scene.imageStatusText || 'Generating...'}</span>
-                                                <div className="w-3/4 bg-slate-800 rounded-full h-1.5 overflow-hidden mt-3">
-                                                    <div
-                                                        className="bg-gradient-to-r from-cyan-500 to-pink-500 h-full transition-all duration-500"
-                                                        style={{ width: `${scene.imageProgress || 5}%` }}
-                                                    ></div>
-                                                </div>
-                                            </div>
-                                        ) : scene.generatedImage ? (
-                                            <>
-                                                <img 
-                                                    src={scene.generatedImage} 
-                                                    alt={`Scene ${index + 1}`}
-                                                    className="w-full h-full object-cover"
-                                                />
-                                                {scene.isManualUpload && (
-                                                    <div className="absolute top-2 right-2 bg-purple-500 text-white text-xs px-2 py-1 rounded">
-                                                        Manual Upload
-                                                    </div>
-                                                )}
-                                            </>
-                                        ) : scene.error ? (
-                                            <div className="absolute inset-0 flex flex-col items-center justify-center text-red-400 text-xs p-2 text-center">
-                                                <span className="mb-1">❌</span>
-                                                <span>{scene.error}</span>
-                                            </div>
-                                        ) : (
-                                            <div 
-                                                className="absolute inset-0 flex flex-col items-center justify-center text-slate-600 text-sm cursor-pointer hover:bg-slate-900/50 transition-all"
-                                                onClick={() => document.getElementById(`imageUpload-${index}`).click()}
-                                                onPaste={(e) => handleSceneImagePaste(index, e)}
-                                                tabIndex={0}
-                                            >
-                                                <span className="text-2xl mb-2">📷</span>
-                                                <span>Click to upload</span>
-                                                <span className="text-xs text-slate-700 mt-1">or paste (Ctrl+V)</span>
-                                            </div>
-                                        )}
-                                        <input 
-                                            id={`imageUpload-${index}`}
-                                            type="file" 
-                                            accept="image/*" 
-                                            className="hidden" 
-                                            onChange={(e) => handleSceneImageUpload(index, e.target.files[0])}
-                                        />
-                                    </div>
-
-                                    {/* Image Controls */}
-                                    <div className="flex gap-2 mb-3">
-                                        <button 
-                                            className="flex-1 bg-cyan-600 hover:bg-cyan-700 text-white font-semibold py-2 px-3 rounded text-xs transition-all disabled:opacity-50"
-                                            onClick={() => generateSceneImageSafely(index)}
-                                            disabled={scene.isGenerating || isGeneratingImages}
-                                        >
-                                            {scene.isGenerating ? '⏳ Generating...' : scene.generatedImage ? '🔄 Regenerate' : scene.error ? '🔄 Retry' : '🎨 Generate Frame'}
-                                        </button>
-                                        {scene.generatedImage && (
-                                            <button 
-                                                className="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 px-3 rounded text-xs transition-all"
-                                                onClick={() => downloadImage(scene.generatedImage, `scene_${index + 1}.png`)}
-                                                title="Download frame"
-                                            >
-                                                💾
-                                            </button>
-                                        )}
-                                        {scene.generatedImageModel === 'nanoBanana2' && !scene.isGenerating && (
-                                            <button
-                                                className="bg-yellow-500/15 hover:bg-yellow-500/25 border border-yellow-400/30 text-yellow-100 font-semibold py-2 px-3 rounded text-xs transition-all"
-                                                onClick={() => redoSceneImageWithPro(index)}
-                                                title="Re-render this frame with NanoBanana Pro using the same prompt and seed"
-                                            >
-                                                ✨ Redo with Pro
-                                            </button>
-                                        )}
-                                    </div>
-
-                                    {/* Video Generation & Preview */}
-                                    {scene.generatedImage && (
-                                        <div className="space-y-2">
-                                            {/* Video Status */}
-                                            {scene.isGeneratingVideo && (
-                                                <div className="bg-pink-500/10 border border-pink-500/30 rounded p-2">
-                                                    <div className="flex justify-between items-center mb-1">
-                                                        <span className="text-xs text-pink-400 font-semibold">🎬 Rendering Video...</span>
-                                                        <span className="text-xs text-pink-400">{scene.videoProgress}%</span>
-                                                    </div>
-                                                    <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                                                        <div 
-                                                            className="bg-gradient-to-r from-pink-500 to-purple-500 h-full transition-all duration-300"
-                                                            style={{ width: `${scene.videoProgress}%` }}
-                                                        ></div>
-                                                    </div>
-                                                </div>
-                                            )}
-
-                                            {/* Video Preview */}
-                                            {scene.videoUrl && (
-                                                <div className="relative bg-slate-950 rounded-lg overflow-hidden" style={{ aspectRatio: '9/16' }}>
-                                                    <video 
-                                                        src={scene.videoUrl}
-                                                        controls
-                                                        className="w-full h-full object-cover"
-                                                    />
-                                                </div>
-                                            )}
-
-                                            {/* Video Controls */}
-                                            <div className="flex gap-2">
-                                                {!scene.videoUrl && !scene.isGeneratingVideo && (
-                                                    <button 
-                                                        className="flex-1 bg-gradient-to-r from-pink-500 to-pink-600 hover:from-pink-600 hover:to-pink-700 text-white font-semibold py-2 px-3 rounded text-xs transition-all"
-                                                        onClick={() => generateSceneVideo(index)}
-                                                    >
-                                                        🎬 Animate (I2V)
-                                                    </button>
-                                                )}
-                                                {scene.videoUrl && (
-                                                    <>
-                                                        <button 
-                                                            className="flex-1 bg-pink-600 hover:bg-pink-700 text-white font-semibold py-2 px-3 rounded text-xs transition-all"
-                                                            onClick={() => generateSceneVideo(index)}
-                                                        >
-                                                            🔄 Regenerate Video
-                                                        </button>
-                                                        <button 
-                                                            className="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 px-3 rounded text-xs transition-all"
-                                                            onClick={() => downloadVideo(scene.videoUrl, `scene_${index + 1}.mp4`)}
-                                                            title="Download video"
-                                                        >
-                                                            💾
-                                                        </button>
-                                                    </>
-                                                )}
-                                            </div>
-                                            {isLiteVideoEngine && !scene.isGeneratingVideo && (
-                                                <p className="text-xs text-pink-200 bg-pink-500/10 border border-pink-500/30 rounded p-2">
-                                                    Optimizing for speed: Static camera enabled.
-                                                </p>
-                                            )}
-                                        </div>
-                                    )}
-                                    
-                                    {/* Visual Description and Script */}
-                                    <div className="mt-3 space-y-2">
-                                        <div className="text-xs bg-slate-800 p-2 rounded border-l-2 border-cyan-500">
-                                            <span className="text-cyan-400 font-semibold">Visual:</span> {scene.frameDescription}
-                                        </div>
-                                        {scene.dialogue && (
-                                            <div className="text-xs bg-purple-500/10 border border-purple-500/30 rounded p-2">
-                                                <span className="text-purple-400 font-semibold">💬 Script:</span> "{scene.dialogue}"
-                                            </div>
-                                        )}
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* Step 4: Video Prompts */}
-            {scenes.length > 0 && (
-                <div className="max-w-7xl mx-auto mt-6">
-                    <div className="bg-slate-800/50 backdrop-blur border border-slate-700 rounded-2xl p-6">
-                        <div className="flex items-center justify-between mb-4">
-                            <div className="flex items-center gap-3">
-                                <span className="flex items-center justify-center w-8 h-8 bg-pink-500 rounded-full text-sm font-bold">4</span>
-                                <h2 className="mono text-xl font-bold text-cyan-400">🎬 Video Prompts</h2>
-                            </div>
-                            <div className="flex gap-2">
-                                <button 
-                                    className="bg-gradient-to-r from-purple-500 to-purple-600 hover:from-purple-600 hover:to-purple-700 text-white font-bold py-2 px-4 rounded-lg text-sm transition-all"
-                                    onClick={generateAllVideoPrompts}
-                                >
-                                    ✨ Generate All Video Prompts
-                                </button>
-                                <button 
-                                    className="bg-slate-700 hover:bg-slate-600 text-white font-bold py-2 px-4 rounded-lg text-sm transition-all"
-                                    onClick={copyAllVideoPrompts}
-                                >
-                                    📋 Copy All Video Prompts
-                                </button>
-                            </div>
-                        </div>
-
-                        <div className="bg-cyan-500/10 border border-cyan-500/30 rounded-lg p-4 mb-4 text-sm">
-                            <div className="flex items-center justify-between flex-wrap gap-4">
-                                <div>
-                                    🎥 Using <strong>{videoPromptEngine === 'kling' ? 'Kling 3.0' : 'Google Veo'}</strong> format • Ready for batch paste
-                                </div>
-                                <div className="flex items-center gap-4 text-xs">
-                                    <div className="flex items-center gap-2">
-                                        <span className="text-pink-400 font-semibold">Engine:</span>
-                                        <span className="bg-pink-500/20 px-2 py-1 rounded">{(VIDEO_MODEL_CONFIGS[activeVideoEngine] || VIDEO_MODEL_CONFIGS['veo-3.1-fast']).label}</span>
-                                    </div>
-                                    <div className="flex items-center gap-2">
-                                        <span className="text-pink-400 font-semibold">Resolution:</span>
-                                        <span className="bg-pink-500/20 px-2 py-1 rounded">{videoResolution}</span>
-                                    </div>
-                                    <div className="flex items-center gap-2">
-                                        <span className="text-pink-400 font-semibold">Audio:</span>
-                                        <span className="bg-pink-500/20 px-2 py-1 rounded">{videoAudio ? 'ON' : 'OFF'}</span>
-                                    </div>
-                                    <div className="flex items-center gap-2">
-                                        <span className="text-yellow-400 font-semibold">Est. Cost:</span>
-                                        <span className="bg-yellow-500/20 px-2 py-1 rounded font-bold">{estimatedCost.toFixed(1)} pts</span>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            {scenes.map((scene, index) => {
-                                const videoPrompt = scene.videoPrompt || generateVideoPrompt(scene);
-                                return (
-                                    <div key={index} className="bg-slate-900 border border-slate-700 rounded-lg p-4">
-                                    <div className="flex justify-between items-center mb-3">
-                                        <span className="mono font-bold text-yellow-400">Scene {index + 1}</span>
-                                        <div className="flex items-center gap-2">
-                                            <span className="text-xs text-slate-400">{scene.duration}s • {videoResolution}</span>
-                                            <span className="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-0.5 rounded">
-                                                {(scene.duration * (VIDEO_MODEL_CONFIGS[activeVideoEngine] || VIDEO_MODEL_CONFIGS['veo-3.1-fast']).pointsPerSecond).toFixed(1)} pts
-                                            </span>
-                                        </div>
-                                    </div>
-                                        
-                                        <div className="mono text-xs bg-slate-950 p-3 rounded border border-slate-700 mb-3 max-h-48 overflow-y-auto text-cyan-400 leading-relaxed">
-                                            {videoPrompt}
-                                        </div>
-
-                                    {scene.dialogue && (
-                                        <div className="text-xs bg-purple-500/10 border border-purple-500/30 rounded p-2 mb-3 flex items-center justify-between">
-                                            <div>
-                                                <span className="text-purple-400 font-semibold">🔊 Audio:</span> {videoAudio ? 'ON' : 'OFF'}
-                                            </div>
-                                            {videoAudio && scene.dialogue && (
-                                                <span className="text-xs text-purple-300">w/ Lip-Sync</span>
-                                            )}
-                                        </div>
-                                    )}
-
-                                        <button 
-                                            className="w-full bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 px-4 rounded text-sm transition-all"
-                                            onClick={() => copyToClipboard(videoPrompt)}
-                                        >
-                                            📋 Copy Prompt
-                                        </button>
-                                    </div>
-                                );
-                            })}
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* Workflow Guide */}
-            <div className="max-w-7xl mx-auto mt-6">
-                <div className="bg-slate-800/50 backdrop-blur border border-slate-700 rounded-2xl p-6">
-                    <h2 className="mono text-xl font-bold text-cyan-400 mb-4">📖 Workflow Guide</h2>
-                    
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-                        <div>
-                            <h3 className="text-pink-400 font-bold mb-2">1. Scene Creation</h3>
-                            <p className="text-slate-400 text-sm leading-relaxed">
-                                Generate from script OR manually add scenes. Edit titles, descriptions, dialogue, and duration inline.
-                            </p>
-                        </div>
-                        <div>
-                            <h3 className="text-cyan-400 font-bold mb-2">2. Add Images</h3>
-                            <p className="text-slate-400 text-sm leading-relaxed">
-                                AI-generate frames OR paste your own images (Ctrl+V). Upload manually or use reference photos directly.
-                            </p>
-                        </div>
-                        <div>
-                            <h3 className="text-pink-400 font-bold mb-2">3. Animate (I2V)</h3>
-                            <p className="text-slate-400 text-sm leading-relaxed">
-                                Convert any image to video via Kie.ai. Parallel processing with real-time progress (3s polling).
-                            </p>
-                        </div>
-                        <div>
-                            <h3 className="text-purple-400 font-bold mb-2">4. Export All</h3>
-                            <p className="text-slate-400 text-sm leading-relaxed">
-                                Download frames/videos individually or as ZIP. Copy prompts for documentation or batch processing.
-                            </p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            {/* System Logs */}
-            <div className="max-w-7xl mx-auto mt-6">
-                <div className="bg-slate-800/50 backdrop-blur border border-slate-700 rounded-2xl overflow-hidden">
-                    <div className="flex items-center justify-between p-4 border-b border-slate-700">
-                        <button
-                            className="mono text-xl font-bold text-green-400 flex items-center gap-2"
-                            onClick={() => setLogsCollapsed(prev => !prev)}
-                        >
-                            <span>{logsCollapsed ? '▶' : '▼'}</span>
-                            <span>System Logs</span>
-                            <span className="text-xs bg-green-500/20 text-green-300 px-2 py-1 rounded">{logs.length}/200</span>
-                        </button>
-                        <div className="flex gap-2">
-                            <button
-                                className="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg text-sm transition-all disabled:opacity-50"
-                                onClick={copyEntireLog}
-                                disabled={logs.length === 0}
-                            >
-                                📋 Copy Entire Log
-                            </button>
-                            <button
-                                className="bg-slate-700 hover:bg-slate-600 text-white font-bold py-2 px-4 rounded-lg text-sm transition-all disabled:opacity-50"
-                                onClick={() => setLogs([])}
-                                disabled={logs.length === 0}
-                            >
-                                Clear Log
-                            </button>
-                        </div>
-                    </div>
-
-                    {!logsCollapsed && (
-                        <div ref={logsContainerRef} className="bg-black font-mono text-xs p-4 h-72 overflow-y-auto border-t border-green-500/20">
-                            {logs.length === 0 ? (
-                                <div className="text-slate-500">No activity yet. Pipeline events will appear here.</div>
-                            ) : (
-                                logs.map(log => (
-                                    <div
-                                        key={log.id}
-                                        className={
-                                            log.type === 'ERROR' ? 'text-red-400 whitespace-pre-wrap mb-1' :
-                                            log.type === 'SUCCESS' ? 'text-green-400 whitespace-pre-wrap mb-1' :
-                                            log.type === 'POLLING' ? 'text-cyan-300 whitespace-pre-wrap mb-1' :
-                                            'text-slate-300 whitespace-pre-wrap mb-1'
-                                        }
-                                    >
-                                        {formatLogEntry(log)}
-                                    </div>
-                                ))
-                            )}
-                        </div>
-                    )}
-                </div>
-            </div>
         </div>
     );
 }
