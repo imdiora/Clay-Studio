@@ -29,6 +29,12 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/openai-proxy/, ''),
         secure: true,
       },
+      '/anthropic-proxy': {
+        target: 'https://api.anthropic.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/anthropic-proxy/, ''),
+        secure: true,
+      },
     },
   },
   preview: {

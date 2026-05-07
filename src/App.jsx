@@ -242,6 +242,11 @@ const PTS_COST = { image: 10, video: 50, voiceover: 5 };
 
 const WIZARD_STEPS = ['Story', 'Scene Breakdown', 'Images', 'Animate', 'Voiceover'];
 
+const canUseServerApiKeys = () => {
+    if (typeof window === 'undefined') return false;
+    return !['localhost', '127.0.0.1'].includes(window.location.hostname);
+};
+
 const ClayStudioLogo = () => (
     <svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Clay Studio">
         <path d="M18 2C9.8 2 4 8.2 4 15.5C4 18.5 4.5 21.5 6.5 24C8.2 26.1 8 29.2 12 31.5C14 32.6 16 33.5 18 33.5C20 33.5 22 32.6 24 31.5C28 29.2 27.8 26.1 29.5 24C31.5 21.5 32 18.5 32 15.5C32 8.2 26.2 2 18 2Z" fill="url(#cs-grad)" />
@@ -260,7 +265,7 @@ export default function App() {
     const [anthropicKey, setAnthropicKey] = useState(() => localStorage.getItem('anthropicKey') || '');
     const [openAIKey, setOpenAIKey] = useState(() => localStorage.getItem('openAIKey') || '');
     const [geminiKey, setGeminiKey] = useState(() => localStorage.getItem('geminiKey') || '');
-    const [kieAiKey, setKieAiKey] = useState(() => localStorage.getItem('kieAiKey') || '2edf9c1f2454e5b6e8e5bdbae5690ad1');
+    const [kieAiKey, setKieAiKey] = useState(() => localStorage.getItem('kieAiKey') || '');
     const [activeTextProvider, setActiveTextProvider] = useState(() => localStorage.getItem('activeTextProvider') || 'openai');
     const [activeImageModel, setActiveImageModel] = useState(() => localStorage.getItem('activeImageModel') || 'nanoBanana2');
     const [activeVideoEngine, setActiveVideoEngine] = useState(() => {
@@ -506,7 +511,7 @@ export default function App() {
         const currentKey = activeTextProvider === 'openai' ? openAIKey : 
                           activeTextProvider === 'anthropic' ? anthropicKey : geminiKey;
 
-        if (!currentKey.trim()) {
+        if (!currentKey.trim() && !canUseServerApiKeys()) {
             addLog('ERROR', `Scene breakdown blocked: missing ${activeTextProvider.toUpperCase()} API key.`);
             alert(`Please enter your ${activeTextProvider.toUpperCase()} API key first`);
             return;
@@ -574,7 +579,7 @@ Guidelines:
                         openaiMessages.push({ role: 'user', content: userPrompt });
                     }
 
-                    response = await fetch('https://api.openai.com/v1/chat/completions', {
+                    response = await fetch('/openai-proxy/v1/chat/completions', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
@@ -619,7 +624,7 @@ Guidelines:
                         text: userPrompt
                     });
 
-                    response = await fetch('https://api.anthropic.com/v1/messages', {
+                    response = await fetch('/anthropic-proxy/v1/messages', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
@@ -849,7 +854,7 @@ Guidelines:
         const imageModelConfig = getImageModelConfig(selectedImageModel);
         const isFastImageModel = selectedImageModel === 'nanoBanana2';
 
-        if (!currentKey.trim()) {
+        if (!currentKey.trim() && !canUseServerApiKeys()) {
             addLog('ERROR', `Scene ${sceneIndex + 1} image generation blocked: missing Gemini API key.`);
             throw new Error('Gemini API key required for image generation');
         }
@@ -1204,7 +1209,7 @@ Guidelines:
 
     // Generate all images with chunked parallelism
     const generateAllImages = async () => {
-        if (!geminiKey.trim()) {
+        if (!geminiKey.trim() && !canUseServerApiKeys()) {
             alert('Please enter your Gemini API key for image generation');
             return;
         }
@@ -1690,7 +1695,6 @@ Guidelines:
             fileName
         };
         const uploadEndpoints = [
-            'https://kieai.redpandaai.co/api/file-base64-upload',
             '/kie-proxy/api/file-base64-upload'
         ];
 
@@ -1756,7 +1760,7 @@ Guidelines:
             return;
         }
 
-        if (!kieAiKey.trim()) {
+        if (!kieAiKey.trim() && !canUseServerApiKeys()) {
             addLog('ERROR', 'Video generation blocked: missing Kie.ai API key.');
             alert('Please enter your Kie.ai API key');
             return;
@@ -2166,7 +2170,7 @@ Guidelines:
 
     // Generate all videos in parallel
     const generateAllVideos = async () => {
-        if (!kieAiKey.trim()) {
+        if (!kieAiKey.trim() && !canUseServerApiKeys()) {
             alert('Please enter your Kie.ai API key');
             return;
         }
@@ -2550,7 +2554,7 @@ Guidelines:
         const selectedVoiceId = normalizeVoiceId(scene?.voiceId);
         const selectedVibe = scene?.voiceVibe || 'Neutral';
 
-        if (!openAIKey.trim()) {
+        if (!openAIKey.trim() && !canUseServerApiKeys()) {
             alert('Please enter your OpenAI API key for narrator audio.');
             addLog('ERROR', `Scene ${sceneIndex + 1} audio generation blocked: missing OpenAI API key.`);
             return;

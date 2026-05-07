@@ -10,23 +10,29 @@
     Cross-Origin-Embedder-Policy = "credentialless"
 
 # Production equivalents of the local Vite dev proxies.
-# Without these, Netlify serves index.html for /gemini-proxy, /kie-proxy,
-# and /openai-proxy, causing JSON parsing errors that start with "<!DOCTYPE".
+# These run through Netlify Functions so API keys can come from environment
+# variables instead of being bundled into the frontend.
 [[redirects]]
   from = "/gemini-proxy/*"
-  to = "https://generativelanguage.googleapis.com/:splat"
+  to = "/.netlify/functions/gemini-proxy/:splat"
   status = 200
   force = true
 
 [[redirects]]
   from = "/kie-proxy/*"
-  to = "https://api.kie.ai/:splat"
+  to = "/.netlify/functions/kie-proxy/:splat"
   status = 200
   force = true
 
 [[redirects]]
   from = "/openai-proxy/*"
-  to = "https://api.openai.com/:splat"
+  to = "/.netlify/functions/openai-proxy/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/anthropic-proxy/*"
+  to = "/.netlify/functions/anthropic-proxy/:splat"
   status = 200
   force = true
 
