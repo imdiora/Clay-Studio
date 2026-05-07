@@ -25,6 +25,12 @@
   force = true
 
 [[redirects]]
+  from = "/kie-upload-proxy/*"
+  to = "/.netlify/functions/kie-upload-proxy/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
   from = "/openai-proxy/*"
   to = "/.netlify/functions/openai-proxy/:splat"
   status = 200

@@ -23,6 +23,12 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/kie-proxy/, ''),
         secure: true,
       },
+      '/kie-upload-proxy': {
+        target: 'https://kieai.redpandaai.co',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/kie-upload-proxy/, ''),
+        secure: true,
+      },
       '/openai-proxy': {
         target: 'https://api.openai.com',
         changeOrigin: true,

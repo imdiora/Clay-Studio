@@ -1627,6 +1627,41 @@ Guidelines:
         reader.readAsDataURL(blob);
     });
 
+    const getDataUrlByteLength = (dataUrl) => {
+        const base64Data = dataUrl.split(',')[1] || '';
+        return Math.round((base64Data.length * 3) / 4);
+    };
+
+    const optimizeImageForKieUpload = (dataUrl, options = {}) => new Promise((resolve) => {
+        const {
+            maxWidth = 576,
+            maxHeight = 1024,
+            quality = 0.68
+        } = options;
+
+        if (!dataUrl?.startsWith('data:image/')) {
+            resolve(dataUrl);
+            return;
+        }
+
+        const image = new Image();
+        image.onload = () => {
+            const scale = Math.min(1, maxWidth / image.width, maxHeight / image.height);
+            const width = Math.max(1, Math.round(image.width * scale));
+            const height = Math.max(1, Math.round(image.height * scale));
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#0f172a';
+            ctx.fillRect(0, 0, width, height);
+            ctx.drawImage(image, 0, 0, width, height);
+            resolve(canvas.toDataURL('image/jpeg', quality));
+        };
+        image.onerror = () => resolve(dataUrl);
+        image.src = dataUrl;
+    });
+
     const normalizeImageForKie = async (imageSource) => {
         if (!imageSource) {
             throw new Error('No scene image available for Kie.ai payload');
@@ -1640,18 +1675,24 @@ Guidelines:
         }
 
         if (normalizedSource.startsWith('data:')) {
-            const [metadata, base64Data] = normalizedSource.split(',');
+            const originalByteLength = getDataUrlByteLength(normalizedSource);
+            const optimizedSource = await optimizeImageForKieUpload(normalizedSource);
+            const optimizedByteLength = getDataUrlByteLength(optimizedSource);
+            const [metadata, base64Data] = optimizedSource.split(',');
             if (!base64Data) {
                 throw new Error('Loaded image data URL is missing Base64 content');
             }
 
             const mimeType = metadata.match(/^data:(.*?);base64$/)?.[1] || 'image/png';
+            if (optimizedByteLength < originalByteLength) {
+                addLog('SUCCESS', `Optimized image for Kie upload: ${(originalByteLength / 1024 / 1024).toFixed(2)} MB → ${(optimizedByteLength / 1024 / 1024).toFixed(2)} MB.`);
+            }
             return {
                 value: base64Data,
-                dataUrl: normalizedSource,
+                dataUrl: optimizedSource,
                 mimeType,
                 sourceType: 'base64',
-                byteLength: Math.round((base64Data.length * 3) / 4),
+                byteLength: optimizedByteLength,
                 preview: `${base64Data.slice(0, 80)}...`
             };
         }
@@ -1667,13 +1708,16 @@ Guidelines:
             };
         }
 
+        const fallbackSource = await optimizeImageForKieUpload(`data:image/png;base64,${normalizedSource}`);
+        const [, fallbackBase64Data] = fallbackSource.split(',');
+        const fallbackMimeType = fallbackSource.match(/^data:(.*?);base64,/)?.[1] || 'image/jpeg';
         return {
-            value: normalizedSource,
-            dataUrl: `data:image/png;base64,${normalizedSource}`,
-            mimeType: 'image/png',
+            value: fallbackBase64Data || normalizedSource,
+            dataUrl: fallbackSource,
+            mimeType: fallbackMimeType,
             sourceType: 'base64',
-            byteLength: Math.round((normalizedSource.length * 3) / 4),
-            preview: `${normalizedSource.slice(0, 80)}...`
+            byteLength: getDataUrlByteLength(fallbackSource),
+            preview: `${(fallbackBase64Data || normalizedSource).slice(0, 80)}...`
         };
     };
 
@@ -1695,7 +1739,7 @@ Guidelines:
             fileName
         };
         const uploadEndpoints = [
-            '/kie-proxy/api/file-base64-upload'
+            '/kie-upload-proxy/api/file-base64-upload'
         ];
 
         let uploadResponse = null;
@@ -1730,7 +1774,13 @@ Guidelines:
         }
 
         if (!uploadResponse?.ok) {
-            throw new Error(`Kie image upload failed (${uploadResponse?.status || 'unknown'}): ${uploadData?.msg || uploadData?.message || JSON.stringify(uploadData)}`);
+            const rawUploadMessage = uploadData?.msg || uploadData?.message || JSON.stringify(uploadData);
+            const isTimeoutHtml = uploadResponse?.status === 504 || /inactivity timeout|<!doctype|<html/i.test(rawUploadMessage);
+            throw new Error(
+                isTimeoutHtml
+                    ? `Kie image upload timed out. The frame upload was too large or the upload service stalled; the app now compresses frames before upload, so retry this scene.`
+                    : `Kie image upload failed (${uploadResponse?.status || 'unknown'}): ${rawUploadMessage}`
+            );
         }
 
         const imageUrl = uploadData.downloadUrl ||
