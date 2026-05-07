@@ -94,11 +94,10 @@ const removeKlingNegativeTerms = (prompt) => prompt
 const IMAGE_MODEL_CONFIGS = {
     nanoBanana2: {
         label: 'NanoBanana 2',
-        modelId: 'gemini-2.5-flash-image-preview',
+        modelId: 'gemini-2.5-flash-image',
         candidateModelIds: [
-            'gemini-2.5-flash-image-preview',
             'gemini-2.5-flash-image',
-            'gemini-2.0-flash-preview-image-generation'
+            'gemini-3-pro-image'
         ],
         quality: 'standard',
         steps: 'minimum',
@@ -112,11 +111,10 @@ const IMAGE_MODEL_CONFIGS = {
     },
     nanoBananaPro: {
         label: 'NanoBanana Pro',
-        modelId: 'gemini-3-pro-image-preview',
+        modelId: 'gemini-3-pro-image',
         candidateModelIds: [
-            'gemini-3-pro-image-preview',
             'gemini-3-pro-image',
-            'gemini-2.5-flash-image-preview'
+            'gemini-2.5-flash-image'
         ],
         quality: 'high',
         steps: 'standard',
@@ -308,6 +306,7 @@ export default function App() {
     const ffmpegLoadPromiseRef = useRef(null);
     const activeImageGenTimersRef = useRef(new Map());
     const imageAbortControllersRef = useRef(new Map());
+    const imageBatchCancelRef = useRef(false);
     const videoAbortControllersRef = useRef(new Map());
     const videoPollingIntervalsRef = useRef(new Map());
     const audioAbortControllersRef = useRef(new Map());
@@ -810,9 +809,14 @@ Guidelines:
     };
 
     // Helper function for chunked parallel processing
-    const processInChunks = async (items, chunkSize, processFn, delayMs = 1500) => {
+    const processInChunks = async (items, chunkSize, processFn, delayMs = 1500, shouldStop = () => false) => {
         const results = [];
         for (let i = 0; i < items.length; i += chunkSize) {
+            if (shouldStop()) {
+                addLog('SUCCESS', 'Image batch stopped before starting the next chunk.');
+                break;
+            }
+
             const chunk = items.slice(i, i + chunkSize);
             console.log(`Processing chunk ${Math.floor(i / chunkSize) + 1}/${Math.ceil(items.length / chunkSize)}`);
             addLog('API_CALL', `Starting image batch ${Math.floor(i / chunkSize) + 1}/${Math.ceil(items.length / chunkSize)} with ${chunk.length} scene(s).`);
@@ -827,6 +831,10 @@ Guidelines:
             
             // Add delay between chunks to avoid rate limits (except for last chunk)
             if (i + chunkSize < items.length) {
+                if (shouldStop()) {
+                    addLog('SUCCESS', 'Image batch stopped after current chunk.');
+                    break;
+                }
                 await new Promise(resolve => setTimeout(resolve, delayMs));
             }
         }
@@ -914,6 +922,25 @@ Guidelines:
                 return parts;
             };
 
+            const waitForImageRetry = (delayMs) => new Promise((resolve, reject) => {
+                if (imageAbortController.signal.aborted) {
+                    reject(new Error(USER_CANCELLED_REQUEST));
+                    return;
+                }
+
+                const timeoutId = setTimeout(() => {
+                    imageAbortController.signal.removeEventListener('abort', onAbort);
+                    resolve();
+                }, delayMs);
+
+                const onAbort = () => {
+                    clearTimeout(timeoutId);
+                    reject(new Error(USER_CANCELLED_REQUEST));
+                };
+
+                imageAbortController.signal.addEventListener('abort', onAbort, { once: true });
+            });
+
             const requestNanoBananaImage = async (imageParts, requestTimeoutMs, attemptLabel, candidateModelId = modelId) => {
                 const promptText = imageParts[imageParts.length - 1]?.text || scene.frameDescription;
                 const timerLabel = `[Image API] Scene ${sceneIndex + 1} ${imageModelConfig.label} ${attemptLabel} ${candidateModelId}`;
@@ -943,31 +970,56 @@ Guidelines:
             const requestImageWithModelFallback = async (imageParts, requestTimeoutMs, attemptLabel) => {
                 let lastResponse = null;
                 let lastData = null;
+                let lastResolvedModelId = candidateModelIds[candidateModelIds.length - 1];
+                const transientStatusCodes = new Set([429, 503]);
+                const retryDelays = [1500, 4000];
 
                 for (const candidateModelId of candidateModelIds) {
-                    const candidateResponse = await requestNanoBananaImage(imageParts, requestTimeoutMs, attemptLabel, candidateModelId);
-                    const candidateData = await candidateResponse.json();
+                    for (let attemptIndex = 0; attemptIndex <= retryDelays.length; attemptIndex += 1) {
+                        const retryLabel = attemptIndex === 0 ? attemptLabel : `${attemptLabel} retry ${attemptIndex}`;
+                        const candidateResponse = await requestNanoBananaImage(imageParts, requestTimeoutMs, retryLabel, candidateModelId);
+                        const candidateData = await candidateResponse.json();
 
-                    if (candidateResponse.ok) {
-                        return { response: candidateResponse, data: candidateData, resolvedModelId: candidateModelId };
-                    }
+                        if (candidateResponse.ok) {
+                            return { response: candidateResponse, data: candidateData, resolvedModelId: candidateModelId };
+                        }
 
-                    lastResponse = candidateResponse;
-                    lastData = candidateData;
+                        lastResponse = candidateResponse;
+                        lastData = candidateData;
+                        lastResolvedModelId = candidateModelId;
 
-                    const errorMessage = candidateData.error?.message || '';
-                    const canTryNextModel = candidateResponse.status === 404 && /not found|not supported/i.test(errorMessage);
-                    if (!canTryNextModel) {
+                        const errorMessage = candidateData.error?.message || '';
+                        const isTransient = transientStatusCodes.has(candidateResponse.status);
+                        const canRetrySameModel = isTransient && attemptIndex < retryDelays.length;
+
+                        if (canRetrySameModel) {
+                            const delayMs = retryDelays[attemptIndex];
+                            addLog('ERROR', `${candidateModelId} returned ${candidateResponse.status} (${errorMessage || 'temporary capacity issue'}). Retrying in ${(delayMs / 1000).toFixed(1)}s.`);
+                            await waitForImageRetry(delayMs);
+                            continue;
+                        }
+
+                        const canTryNextModel = (
+                            (candidateResponse.status === 404 && /not found|not supported/i.test(errorMessage)) ||
+                            isTransient
+                        );
+
+                        if (canTryNextModel && candidateModelId !== candidateModelIds[candidateModelIds.length - 1]) {
+                            addLog('ERROR', `${candidateModelId} is unavailable or overloaded for image generation. Trying next Gemini image model.`);
+                        }
+
+                        if (!canTryNextModel) {
+                            return { response: candidateResponse, data: candidateData, resolvedModelId: candidateModelId };
+                        }
+
                         break;
                     }
-
-                    addLog('ERROR', `${candidateModelId} is unavailable for image generation. Trying next Gemini image model.`);
                 }
 
                 return {
                     response: lastResponse,
                     data: lastData || {},
-                    resolvedModelId: candidateModelIds[candidateModelIds.length - 1]
+                    resolvedModelId: lastResolvedModelId
                 };
             };
 
@@ -989,6 +1041,9 @@ Guidelines:
             if (!response.ok) {
                 if (response.status === 429) {
                     throw new Error('Rate Limit Hit');
+                }
+                if (response.status === 503) {
+                    throw new Error(`Gemini image model is temporarily overloaded after retries (${resolvedModelId}). Please try again in a few minutes or switch to NanoBanana Pro.`);
                 }
                 throw new Error(`API Error (${response.status}) using ${resolvedModelId}: ${data.error?.message || 'Unknown error'}`);
             }
@@ -1112,6 +1167,27 @@ Guidelines:
         addLog('SUCCESS', `Manual cancellation: Scene ${sceneIndex + 1} image generation stopped.`);
     };
 
+    const cancelAllImageGenerations = () => {
+        imageBatchCancelRef.current = true;
+        const activeSceneIndexes = Array.from(imageAbortControllersRef.current.keys());
+
+        activeSceneIndexes.forEach(sceneIndex => {
+            const controller = imageAbortControllersRef.current.get(sceneIndex);
+            controller?.abort();
+            imageAbortControllersRef.current.delete(sceneIndex);
+            clearImageGenerationProgressTimer(sceneIndex);
+        });
+
+        setScenes(prevScenes => prevScenes.map(scene => (
+            scene.isGenerating
+                ? { ...scene, isGenerating: false, imageProgress: 0, imageStatusText: null, error: null }
+                : scene
+        )));
+        setIsGeneratingImages(false);
+        setGenerationProgress({ completed: 0, total: 0 });
+        addLog('SUCCESS', `Cancelled ${activeSceneIndexes.length} active image generation request(s).`);
+    };
+
     const lockCharacterFromSceneOne = () => {
         const sceneOneImage = scenes[0]?.generatedImage;
         if (!sceneOneImage) {
@@ -1145,6 +1221,7 @@ Guidelines:
         }
 
         setIsGeneratingImages(true);
+        imageBatchCancelRef.current = false;
         setGenerationProgress({ completed: 0, total: sceneIndices.length });
         
         const imageModelConfig = getImageModelConfig(activeImageModel);
@@ -1169,8 +1246,14 @@ Guidelines:
                         }));
                     }
                 },
-                DELAY_BETWEEN_CHUNKS
+                DELAY_BETWEEN_CHUNKS,
+                () => imageBatchCancelRef.current
             );
+
+            if (imageBatchCancelRef.current) {
+                addLog('SUCCESS', 'Image batch cancelled by user.');
+                return;
+            }
             
             // Count successes and failures
             const successful = results.filter(r => r.status === 'fulfilled').length;
@@ -1190,6 +1273,7 @@ Guidelines:
             alert(`❌ Batch generation error: ${error.message}`);
         } finally {
             setIsGeneratingImages(false);
+            imageBatchCancelRef.current = false;
             setGenerationProgress({ completed: 0, total: 0 });
         }
     };
@@ -1965,6 +2049,7 @@ Guidelines:
                             updatedScenes[sceneIndex].isGeneratingVideo = false;
                             updatedScenes[sceneIndex].videoStatus = 'failed';
                             updatedScenes[sceneIndex].videoProgress = 100;
+                            updatedScenes[sceneIndex].videoTaskId = null;
                             updatedScenes[sceneIndex].error = 'Video generated but URL not found in response. Check console for details.';
                             setScenes([...updatedScenes]);
                             videoAbortControllersRef.current.delete(sceneIndex);
@@ -1980,13 +2065,21 @@ Guidelines:
                     } else if (successFlag === 2 || successFlag === 3) {
                         // Failed
                         console.error(`❌ Veo video failed for Scene ${sceneIndex + 1}, successFlag=${successFlag}`);
-                        const veoFailureMessage = taskData.errorMessage || 'Video generation failed';
-                        const isSafetyBlock = /safety|restricted|third-party|copyright|content/i.test(veoFailureMessage);
-                        addLog('ERROR', `Scene ${sceneIndex + 1} Veo failed. successFlag=${successFlag}. ${veoFailureMessage}${isSafetyBlock ? ' Try replacing the Start/End frame with original non-IP clay assets and remove brand/character references from the prompt.' : ''}`);
+                        const veoFailureMessage = taskData.errorMessage ||
+                            taskData.failReason ||
+                            taskData.msg ||
+                            taskData.message ||
+                            (successFlag === 3 ? 'Request blocked by Veo safety filters.' : 'Video generation failed');
+                        const isSafetyBlock = successFlag === 3 || /safety|restricted|third-party|copyright|content|blocked|policy/i.test(veoFailureMessage);
+                        const recoveryHint = isSafetyBlock
+                            ? ' Replace the Start/End frame with original non-IP clay assets, avoid visible copyrighted characters/logos/text, then retry with a simpler prompt.'
+                            : '';
+                        addLog('ERROR', `Scene ${sceneIndex + 1} Veo failed. successFlag=${successFlag}. ${veoFailureMessage}${recoveryHint} Task data: ${JSON.stringify(taskData, null, 2)}`);
                         updatedScenes[sceneIndex].isGeneratingVideo = false;
                         updatedScenes[sceneIndex].videoStatus = 'failed';
+                        updatedScenes[sceneIndex].videoTaskId = null;
                         updatedScenes[sceneIndex].error = isSafetyBlock
-                            ? `Safety filters blocked the request: ${veoFailureMessage}`
+                            ? `Veo safety filters blocked this scene. ${veoFailureMessage}`
                             : veoFailureMessage;
                         setScenes([...updatedScenes]);
                         videoAbortControllersRef.current.delete(sceneIndex);
@@ -2045,6 +2138,7 @@ Guidelines:
                         addLog('ERROR', `Scene ${sceneIndex + 1} Kling failed. ${taskData.failReason || ''}`);
                         updatedScenes[sceneIndex].isGeneratingVideo = false;
                         updatedScenes[sceneIndex].videoStatus = 'failed';
+                        updatedScenes[sceneIndex].videoTaskId = null;
                         updatedScenes[sceneIndex].error = taskData.failReason || 'Video generation failed';
                         setScenes([...updatedScenes]);
                         videoAbortControllersRef.current.delete(sceneIndex);
@@ -2190,21 +2284,77 @@ Guidelines:
 
     // Live budget — recomputed only when scenes array changes (memoized)
     const liveBudget = React.useMemo(() => {
-        const imagePts = scenesWithImagesCount * PTS_COST.image;
-        const videoPts = scenesWithVideosCount * PTS_COST.video;
-        const audioPts = scenesWithAudioCount * PTS_COST.voiceover;
-        const total = imagePts + videoPts + audioPts;
+        const byCategory = {
+            image: { spent: 0, pending: 0, remaining: 0 },
+            video: { spent: 0, pending: 0, remaining: 0 },
+            voiceover: { spent: 0, pending: 0, remaining: 0 }
+        };
 
-        // Per-engine video breakdown
-        const engineBreakdown = {};
-        scenes.forEach(scene => {
-            if (!scene.videoUrl || !scene.videoEngine) return;
-            const label = VIDEO_MODEL_CONFIGS[scene.videoEngine]?.label || scene.videoEngine;
-            engineBreakdown[label] = (engineBreakdown[label] || 0) + PTS_COST.video;
+        const modelBreakdown = {};
+        const sceneRows = scenes.map((scene, index) => {
+            const imageStatus = scene.generatedImage ? 'spent' : scene.isGenerating ? 'pending' : 'remaining';
+            const videoStatus = scene.videoUrl ? 'spent' : scene.isGeneratingVideo ? 'pending' : 'remaining';
+            const audioStatus = scene.audioUrl ? 'spent' : scene.isGeneratingAudio ? 'pending' : 'remaining';
+
+            byCategory.image[imageStatus] += PTS_COST.image;
+            byCategory.video[videoStatus] += PTS_COST.video;
+            byCategory.voiceover[audioStatus] += PTS_COST.voiceover;
+
+            const imageModelLabel = scene.generatedImageModel === 'nanoBananaPro'
+                ? 'NanoBanana Pro'
+                : scene.generatedImageModel === 'nanoBanana2'
+                    ? 'NanoBanana 2'
+                    : activeImageModel === 'nanoBananaPro'
+                        ? 'NanoBanana Pro'
+                        : 'NanoBanana 2';
+            const videoModelLabel = scene.videoEngine
+                ? (VIDEO_MODEL_CONFIGS[scene.videoEngine]?.label || scene.videoEngine)
+                : (VIDEO_MODEL_CONFIGS[activeVideoEngine]?.label || activeVideoEngine);
+            const voiceModelLabel = 'OpenAI TTS-1';
+
+            const addModelPts = (label, status, pts) => {
+                if (!modelBreakdown[label]) {
+                    modelBreakdown[label] = { spent: 0, pending: 0, remaining: 0 };
+                }
+                modelBreakdown[label][status] += pts;
+            };
+
+            addModelPts(imageModelLabel, imageStatus, PTS_COST.image);
+            addModelPts(videoModelLabel, videoStatus, PTS_COST.video);
+            addModelPts(voiceModelLabel, audioStatus, PTS_COST.voiceover);
+
+            return {
+                index,
+                title: scene.text || `Scene ${index + 1}`,
+                imagePts: PTS_COST.image,
+                imageStatus,
+                videoPts: PTS_COST.video,
+                videoStatus,
+                audioPts: PTS_COST.voiceover,
+                audioStatus,
+                total: PTS_COST.image + PTS_COST.video + PTS_COST.voiceover
+            };
         });
 
-        return { imagePts, videoPts, audioPts, total, engineBreakdown };
-    }, [scenes, scenesWithImagesCount, scenesWithVideosCount, scenesWithAudioCount]);
+        const spent = byCategory.image.spent + byCategory.video.spent + byCategory.voiceover.spent;
+        const pending = byCategory.image.pending + byCategory.video.pending + byCategory.voiceover.pending;
+        const remaining = byCategory.image.remaining + byCategory.video.remaining + byCategory.voiceover.remaining;
+        const projected = spent + pending + remaining;
+
+        return {
+            spent,
+            pending,
+            remaining,
+            projected,
+            imagePts: byCategory.image.spent,
+            videoPts: byCategory.video.spent,
+            audioPts: byCategory.voiceover.spent,
+            total: spent,
+            byCategory,
+            modelBreakdown,
+            sceneRows
+        };
+    }, [scenes, activeImageModel, activeVideoEngine]);
 
     const getSceneStatus = (scene) => {
         if (!scene) return 'Draft';
@@ -2814,7 +2964,12 @@ Guidelines:
                             <div className="bg-cyan-500/10 border border-cyan-500/30 rounded-2xl p-4 mb-4">
                                 <div className="flex items-center justify-between mb-2">
                                     <span className="text-sm font-semibold">{activeImageModel === 'nanoBanana2' ? '⚡ Fast-track generation in progress...' : '⏳ Crafting high-fidelity frames...'}</span>
-                                    <span className="text-sm font-bold text-cyan-400">{generationProgress.completed}/{generationProgress.total}</span>
+                                    <div className="flex items-center gap-3">
+                                        <span className="text-sm font-bold text-cyan-400">{generationProgress.completed}/{generationProgress.total}</span>
+                                        <button onClick={cancelAllImageGenerations} className="inline-flex items-center gap-1 rounded-xl bg-red-500/15 border border-red-500/30 hover:border-red-400 px-3 py-1.5 text-xs font-bold text-red-200 transition">
+                                            <XCircle size={14} /> Cancel active
+                                        </button>
+                                    </div>
                                 </div>
                                 <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
                                     <div className="bg-gradient-to-r from-cyan-500 to-[#C8714F] h-full transition-all duration-500" style={{ width: `${generationProgress.total ? (generationProgress.completed / generationProgress.total) * 100 : 0}%` }}></div>
@@ -2866,6 +3021,11 @@ Guidelines:
                                         <button onClick={() => generateSceneImageSafely(index)} disabled={scene.isGenerating || isGeneratingImages} className="w-full bg-cyan-600/20 hover:bg-cyan-600/40 border border-cyan-600/30 disabled:opacity-40 text-cyan-300 rounded-lg py-1.5 text-[10px] font-semibold transition">
                                             {scene.isGenerating ? '⏳' : scene.generatedImage ? '🔄 Regen' : scene.error ? '🔄 Retry' : '🎨 Generate'}
                                         </button>
+                                        {scene.isGenerating && (
+                                            <button onClick={() => cancelSceneImageGeneration(index)} className="w-full inline-flex items-center justify-center gap-1 bg-red-500/15 hover:bg-red-500/25 border border-red-500/30 hover:border-red-400 text-red-200 rounded-lg py-1.5 text-[10px] font-bold transition">
+                                                <XCircle size={12} /> Cancel
+                                            </button>
+                                        )}
                                         <div className="flex gap-1">
                                             {scene.generatedImage && <button onClick={() => downloadImage(scene.generatedImage, `scene_${index + 1}.png`)} className="flex-1 bg-slate-800 hover:bg-slate-700 rounded-lg py-1.5 text-[10px] transition" title="Save">💾</button>}
                                             {scene.generatedImageModel === 'nanoBanana2' && !scene.isGenerating && (
@@ -3261,14 +3421,39 @@ Guidelines:
 
                                 {/* Budget summary in sidebar */}
                                 <div className="rounded-2xl bg-slate-950/70 border border-slate-700/50 p-3">
-                                    <p className="text-[11px] font-bold text-slate-400 mb-2">Live Budget</p>
-                                    <p className="text-2xl font-black text-[#E8896A]">{liveBudget.total} <span className="text-sm font-semibold text-slate-400">pts</span></p>
-                                    <div className="mt-2 space-y-1 text-[10px] text-slate-500">
-                                        <div className="flex justify-between"><span>Images ({scenesWithImagesCount}×{PTS_COST.image})</span><span>{liveBudget.imagePts} pts</span></div>
-                                        <div className="flex justify-between"><span>Video ({scenesWithVideosCount}×{PTS_COST.video})</span><span>{liveBudget.videoPts} pts</span></div>
-                                        <div className="flex justify-between"><span>Voiceover ({scenesWithAudioCount}×{PTS_COST.voiceover})</span><span>{liveBudget.audioPts} pts</span></div>
-                                        {Object.entries(liveBudget.engineBreakdown).map(([label, pts]) => (
-                                            <div key={label} className="flex justify-between text-slate-600"><span className="truncate">{label}</span><span>{pts} pts</span></div>
+                                    <p className="text-[11px] font-bold text-slate-400 mb-2">Production Credits (pts)</p>
+                                    <div className="grid grid-cols-2 gap-2 mb-3">
+                                        <div className="rounded-xl bg-slate-900/70 border border-slate-700/60 p-2">
+                                            <p className="text-[9px] text-slate-500">Spent</p>
+                                            <p className="text-lg font-black text-[#E8896A]">{liveBudget.spent}</p>
+                                        </div>
+                                        <div className="rounded-xl bg-slate-900/70 border border-slate-700/60 p-2">
+                                            <p className="text-[9px] text-slate-500">Projected</p>
+                                            <p className="text-lg font-black text-slate-200">{liveBudget.projected}</p>
+                                        </div>
+                                        <div className="rounded-xl bg-slate-900/70 border border-slate-700/60 p-2">
+                                            <p className="text-[9px] text-slate-500">Pending</p>
+                                            <p className="text-base font-black text-cyan-300">{liveBudget.pending}</p>
+                                        </div>
+                                        <div className="rounded-xl bg-slate-900/70 border border-slate-700/60 p-2">
+                                            <p className="text-[9px] text-slate-500">Remaining</p>
+                                            <p className="text-base font-black text-slate-400">{liveBudget.remaining}</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="space-y-1 text-[10px] text-slate-500">
+                                        <div className="flex justify-between"><span>Images spent</span><span>{liveBudget.byCategory.image.spent} pts</span></div>
+                                        <div className="flex justify-between"><span>Video spent</span><span>{liveBudget.byCategory.video.spent} pts</span></div>
+                                        <div className="flex justify-between"><span>Voiceover spent</span><span>{liveBudget.byCategory.voiceover.spent} pts</span></div>
+                                    </div>
+
+                                    <div className="mt-3 border-t border-slate-800 pt-2 space-y-1 text-[10px]">
+                                        <p className="font-bold text-slate-500 mb-1">By Model</p>
+                                        {Object.entries(liveBudget.modelBreakdown).map(([label, row]) => (
+                                            <div key={label} className="flex justify-between gap-2 text-slate-500">
+                                                <span className="truncate">{label}</span>
+                                                <span className="shrink-0">{row.spent}/{row.spent + row.pending + row.remaining} pts</span>
+                                            </div>
                                         ))}
                                     </div>
                                 </div>
@@ -3402,6 +3587,31 @@ Guidelines:
                                 </div>
 
                                 <div className="studio-panel rounded-3xl p-4">
+                                    <h3 className="font-black text-base mb-3">Scene Cost</h3>
+                                    <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                                        {liveBudget.sceneRows.map(row => (
+                                            <div key={row.index} className="rounded-2xl bg-slate-950/60 border border-slate-700/50 p-3">
+                                                <div className="flex justify-between gap-2 mb-2">
+                                                    <p className="text-xs font-bold truncate">Scene {row.index + 1}</p>
+                                                    <p className="text-xs text-[#E8896A] font-black">{row.total} pts</p>
+                                                </div>
+                                                <div className="grid grid-cols-3 gap-1 text-[9px] text-center">
+                                                    <div className={`rounded-lg border px-1 py-1 ${row.imageStatus === 'spent' ? 'border-sky-500/40 text-sky-300 bg-sky-500/10' : row.imageStatus === 'pending' ? 'border-cyan-500/40 text-cyan-300 bg-cyan-500/10' : 'border-slate-700 text-slate-500 bg-slate-900/60'}`}>
+                                                        Img {row.imagePts}
+                                                    </div>
+                                                    <div className={`rounded-lg border px-1 py-1 ${row.videoStatus === 'spent' ? 'border-emerald-500/40 text-emerald-300 bg-emerald-500/10' : row.videoStatus === 'pending' ? 'border-orange-500/40 text-orange-300 bg-orange-500/10' : 'border-slate-700 text-slate-500 bg-slate-900/60'}`}>
+                                                        Vid {row.videoPts}
+                                                    </div>
+                                                    <div className={`rounded-lg border px-1 py-1 ${row.audioStatus === 'spent' ? 'border-purple-500/40 text-purple-300 bg-purple-500/10' : row.audioStatus === 'pending' ? 'border-cyan-500/40 text-cyan-300 bg-cyan-500/10' : 'border-slate-700 text-slate-500 bg-slate-900/60'}`}>
+                                                        VO {row.audioPts}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                <div className="studio-panel rounded-3xl p-4">
                                     <h3 className="font-black text-base mb-3">Export Assets</h3>
                                     <div className="space-y-2">
                                         <button onClick={downloadAllFrames} className="w-full rounded-2xl bg-slate-800 hover:bg-slate-700 border border-slate-700 py-2.5 font-semibold text-xs transition">📦 Download Frames (ZIP)</button>
@@ -3430,9 +3640,9 @@ Guidelines:
                     <div className="sm:hidden text-sm font-bold text-slate-400">{WIZARD_STEPS[wizardStep - 1]}</div>
 
                     {/* Live Budget pill */}
-                    {liveBudget.total > 0 && (
-                        <div className="hidden md:flex items-center gap-1.5 rounded-full border border-[#C8714F]/40 bg-[#C8714F]/10 px-3 py-1.5 text-xs font-semibold text-[#E8896A]" title={`Images: ${liveBudget.imagePts} pts · Video: ${liveBudget.videoPts} pts · Audio: ${liveBudget.audioPts} pts`}>
-                            💰 {liveBudget.total} pts
+                    {liveBudget.projected > 0 && (
+                        <div className="hidden md:flex items-center gap-1.5 rounded-full border border-[#C8714F]/40 bg-[#C8714F]/10 px-3 py-1.5 text-xs font-semibold text-[#E8896A]" title={`Spent: ${liveBudget.spent} pts · Pending: ${liveBudget.pending} pts · Remaining estimate: ${liveBudget.remaining} pts · Projected: ${liveBudget.projected} pts`}>
+                            💰 {liveBudget.spent} spent / {liveBudget.projected} projected
                         </div>
                     )}
 
