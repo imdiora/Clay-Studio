@@ -1,0 +1,37 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# Keep FFmpeg / SharedArrayBuffer support working in production.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "credentialless"
+
+# Production equivalents of the local Vite dev proxies.
+# Without these, Netlify serves index.html for /gemini-proxy, /kie-proxy,
+# and /openai-proxy, causing JSON parsing errors that start with "<!DOCTYPE".
+[[redirects]]
+  from = "/gemini-proxy/*"
+  to = "https://generativelanguage.googleapis.com/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/kie-proxy/*"
+  to = "https://api.kie.ai/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/openai-proxy/*"
+  to = "https://api.openai.com/:splat"
+  status = 200
+  force = true
+
+# SPA fallback must come after API proxy rewrites.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
