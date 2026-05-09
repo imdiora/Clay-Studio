@@ -1,10 +1,12 @@
-# Claymation Studio
+# Claymation Studio 🎬
 
 Turn a script into a claymation video in 5 steps — fully automated with AI.
 
 ---
 
 ## Setup
+
+###Click 👉 https://studio-clay.netlify.app/
 
 Go to **Settings** (gear icon, top right) and enter your API keys:
 
