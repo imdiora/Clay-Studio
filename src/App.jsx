@@ -236,6 +236,23 @@ const normalizeVoiceId = (voiceId) => (
 );
 
 const VIBE_OPTIONS = ['Neutral', 'Dramatic', 'Optimistic', 'Whisper', 'Authoritative'];
+const END_HOLD_OPTIONS = [
+    { label: 'None', value: 0 },
+    { label: 'Short +0.5s', value: 0.5 },
+    { label: 'Medium +1.5s', value: 1.5 },
+    { label: 'Long +3s', value: 3 }
+];
+
+const formatSeconds = (seconds) => {
+    const value = Number(seconds);
+    return Number.isFinite(value) ? `${value.toFixed(value % 1 === 0 ? 0 : 1)}s` : '0s';
+};
+
+const getVoiceLedDuration = (audioDuration, endHold = 0.5) => {
+    const audioSeconds = Number(audioDuration) || 0;
+    const holdSeconds = Number(endHold) || 0;
+    return Math.max(3, Math.ceil(audioSeconds + holdSeconds));
+};
 
 // Production credits: 10 pts per image, 50 pts per video, 5 pts per voiceover
 const PTS_COST = { image: 10, video: 50, voiceover: 5 };
@@ -276,6 +293,8 @@ export default function App() {
     const [videoAudio, setVideoAudio] = useState(() => localStorage.getItem('videoAudio') === 'true');
     const [qualityPreset, setQualityPreset] = useState(() => localStorage.getItem('qualityPreset') || 'highQuality');
     const [videoPromptEngine, setVideoPromptEngine] = useState(() => localStorage.getItem('videoPromptEngine') || 'kling');
+    const [globalVoiceId, setGlobalVoiceId] = useState(() => normalizeVoiceId(localStorage.getItem('globalVoiceId') || VOICE_CONFIG[0].id));
+    const [globalVoiceVibe, setGlobalVoiceVibe] = useState(() => localStorage.getItem('globalVoiceVibe') || 'Neutral');
     
     // App state
     const [script, setScript] = useState('');
@@ -317,6 +336,7 @@ export default function App() {
     const audioAbortControllersRef = useRef(new Map());
     const sampleAudioRef = useRef(null);
     const [playingVoiceSample, setPlayingVoiceSample] = useState('');
+    const [isGeneratingAllAudio, setIsGeneratingAllAudio] = useState(false);
 
     // Asset Tray state (Start/End Frame assignment for each scene)
     const [assetTrayOpen, setAssetTrayOpen] = useState(false);
@@ -355,7 +375,9 @@ export default function App() {
         localStorage.setItem('videoAudio', videoAudio.toString());
         localStorage.setItem('qualityPreset', qualityPreset);
         localStorage.setItem('videoPromptEngine', videoPromptEngine);
-    }, [anthropicKey, openAIKey, geminiKey, kieAiKey, activeTextProvider, activeImageModel, activeVideoEngine, videoResolution, videoAudio, qualityPreset, videoPromptEngine]);
+        localStorage.setItem('globalVoiceId', globalVoiceId);
+        localStorage.setItem('globalVoiceVibe', globalVoiceVibe);
+    }, [anthropicKey, openAIKey, geminiKey, kieAiKey, activeTextProvider, activeImageModel, activeVideoEngine, videoResolution, videoAudio, qualityPreset, videoPromptEngine, globalVoiceId, globalVoiceVibe]);
 
     // Calculate estimated cost in Kie.ai points
     useEffect(() => {
@@ -716,6 +738,8 @@ Guidelines:
                     audioUrl: null,
                     audioFileName: '',
                     audioSource: '',
+                    audioDuration: 0,
+                    endHold: 0.5,
                     isGeneratingAudio: false,
                     voiceId: VOICE_CONFIG[0].id,
                     voiceVibe: 'Neutral',
@@ -1418,6 +1442,9 @@ Guidelines:
                 addLog('SUCCESS', `[FFMPEG] Scene ${index + 1} written to VFS as ${filename} (${(videoBlob.size / 1024 / 1024).toFixed(2)} MB).`);
 
                 const muxedFilename = `scene_muxed_${String(i + 1).padStart(3, '0')}.mp4`;
+                const targetDuration = scene.audioDuration
+                    ? getVoiceLedDuration(scene.audioDuration, scene.endHold ?? 0.5)
+                    : (Number(scene.duration) || 5);
                 if (scene.audioUrl) {
                     const audioFilename = `scene_audio_${String(i + 1).padStart(3, '0')}.mp3`;
                     setAssemblyProgress(`Mixing voiceover for Scene ${index + 1}...`);
@@ -1430,7 +1457,7 @@ Guidelines:
 
                     const audioBlob = await audioResponse.blob();
                     await ffmpeg.writeFile(audioFilename, await fetchFile(audioBlob));
-                    addLog('FFMPEG', `Muxing Scene ${index + 1} video with ${scene.audioSource || 'voiceover'} audio.`);
+                    addLog('FFMPEG', `Muxing Scene ${index + 1} with voiceover-only audio. Target=${targetDuration}s, voice=${formatSeconds(scene.audioDuration)}, hold=${formatSeconds(scene.endHold ?? 0.5)}. Generated video audio is muted.`);
                     await ffmpeg.exec([
                         '-i', filename,
                         '-i', audioFilename,
@@ -1438,7 +1465,8 @@ Guidelines:
                         '-map', '1:a:0',
                         '-c:v', 'copy',
                         '-c:a', 'aac',
-                        '-shortest',
+                        '-af', 'apad',
+                        '-t', String(targetDuration),
                         muxedFilename
                     ]);
                     inputFiles.push(muxedFilename);
@@ -1447,7 +1475,7 @@ Guidelines:
                     await ffmpeg.exec([
                         '-i', filename,
                         '-f', 'lavfi',
-                        '-t', String(scene.duration || 5),
+                        '-t', String(targetDuration),
                         '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
                         '-map', '0:v:0',
                         '-map', '1:a:0',
@@ -1509,7 +1537,11 @@ Guidelines:
                 prompt += `Character says "${dialogue}" with matching lip-sync and facial expressions. `;
             }
             
-            prompt += `${claymationStyle}. Animation must start at the first frame. Non-disney. Non-cartoon.`;
+            prompt += `${claymationStyle}. Animation must start at the first frame. `;
+            if ((Number(scene.endHold) || 0) > 0) {
+                prompt += 'After narration ends, hold the final pose with subtle clay stop-motion movement, gentle blinking, breathing, and slow camera drift. No new action. ';
+            }
+            prompt += 'Non-disney. Non-cartoon.';
             
             return prompt;
         } else if (engine === 'veo') {
@@ -1521,6 +1553,9 @@ Guidelines:
             }
             
             prompt += `${claymationStyle}. Professional stop-motion cinematography with depth and detailed textures. Smooth frame-by-frame animation.`;
+            if ((Number(scene.endHold) || 0) > 0) {
+                prompt += ' After narration ends, hold the final pose with subtle clay stop-motion movement, gentle blinking, breathing, and slow camera drift. No new action.';
+            }
             
             return prompt;
         }
@@ -1848,6 +1883,7 @@ Guidelines:
             console.log(`📊 Current engine setting: ${activeVideoEngine}`);
             const endpoint = videoConfig.endpoint;
             const model = videoConfig.model;
+            const requestGeneratedVideoAudio = videoAudio && scene.dialogue && !scene.audioUrl;
 
             console.log(`🎬 Submitting video generation for Scene ${sceneIndex + 1}`);
             console.log(`   Engine: ${activeVideoEngine}`);
@@ -1857,7 +1893,7 @@ Guidelines:
             if (kieEndImage) {
                 addLog('API_CALL', `Scene ${sceneIndex + 1} end frame prepared for Kie.ai: source=${kieEndImage.sourceType}, mime=${kieEndImage.mimeType}, approxBytes=${kieEndImage.byteLength}, imagePreview=${kieEndImage.preview}`);
             }
-            addLog('API_CALL', `Submitting Scene ${sceneIndex + 1} to Kie.ai I2V. Engine=${activeVideoEngine}, Model=${model}, Endpoint=${endpoint}, Mode=${videoConfig.mode || 'default'}, Resolution=${videoResolution}, Audio=${videoAudio && scene.dialogue ? 'ON' : 'OFF'}, imageUrls=${kieImageUrls.join(' → ')}. Prompt: ${submittedVideoPrompt}`);
+            addLog('API_CALL', `Submitting Scene ${sceneIndex + 1} to Kie.ai I2V. Engine=${activeVideoEngine}, Model=${model}, Endpoint=${endpoint}, Mode=${videoConfig.mode || 'default'}, Resolution=${videoResolution}, Audio=${requestGeneratedVideoAudio ? 'ON' : 'OFF'}, imageUrls=${kieImageUrls.join(' → ')}. Prompt: ${submittedVideoPrompt}`);
 
             const requestBody = videoConfig.provider === 'veo'
                 ? {
@@ -1868,7 +1904,7 @@ Guidelines:
                     duration: scene.duration,
                     aspect_ratio: '9:16',
                     resolution: videoResolution,
-                    audio_enabled: videoAudio && scene.dialogue ? true : false
+                    audio_enabled: requestGeneratedVideoAudio
                 }
                 : {
                     model: model,
@@ -1880,7 +1916,7 @@ Guidelines:
                         duration: String(scene.duration),
                         aspect_ratio: '9:16',
                         mode: videoConfig.mode,
-                        sound: videoAudio && scene.dialogue ? true : false,
+                        sound: requestGeneratedVideoAudio,
                         multi_shots: false
                     }
                 };
@@ -2505,6 +2541,8 @@ Guidelines:
             audioUrl: null,
             audioFileName: '',
             audioSource: '',
+            audioDuration: 0,
+            endHold: 0.5,
             isGeneratingAudio: false,
             voiceId: VOICE_CONFIG[0].id,
             voiceVibe: 'Neutral',
@@ -2539,6 +2577,43 @@ Guidelines:
         )));
     };
 
+    const getAudioDuration = (audioUrl) => new Promise((resolve) => {
+        if (!audioUrl) {
+            resolve(0);
+            return;
+        }
+
+        const audio = new Audio();
+        audio.preload = 'metadata';
+        audio.onloadedmetadata = () => {
+            const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
+            audio.src = '';
+            resolve(duration);
+        };
+        audio.onerror = () => {
+            audio.src = '';
+            resolve(0);
+        };
+        audio.src = audioUrl;
+    });
+
+    const updateSceneEndHold = (index, endHoldValue) => {
+        const normalizedHold = Number(endHoldValue) || 0;
+        setScenes(prev => prev.map((scene, sceneIndex) => {
+            if (sceneIndex !== index) return scene;
+            const nextDuration = scene.audioDuration
+                ? getVoiceLedDuration(scene.audioDuration, normalizedHold)
+                : scene.duration;
+            return {
+                ...scene,
+                endHold: normalizedHold,
+                duration: nextDuration,
+                videoPrompt: generateVideoPrompt({ ...scene, endHold: normalizedHold, duration: nextDuration })
+            };
+        }));
+        addLog('SUCCESS', `Scene ${index + 1} end hold set to ${formatSeconds(normalizedHold)}.`);
+    };
+
     const updateScenePromptField = (index, field, value) => {
         updateSceneField(index, field, value);
     };
@@ -2547,20 +2622,41 @@ Guidelines:
         addLog('SUCCESS', `Manual modification: Scene ${index + 1} ${label} updated by user.`);
     };
 
-    const setSceneAudio = (sceneIndex, audioUrl, audioFileName, audioSource) => {
+    const applyGlobalVoiceToAllScenes = () => {
+        const normalizedGlobalVoice = normalizeVoiceId(globalVoiceId);
+        setScenes(prev => prev.map(scene => ({
+            ...scene,
+            voiceId: normalizedGlobalVoice,
+            voiceVibe: globalVoiceVibe
+        })));
+        addLog('SUCCESS', `Applied whole-video voice setting to all scenes: ${normalizedGlobalVoice}, ${globalVoiceVibe}.`);
+        showCopyFeedback('Whole-video voice applied to all scenes!');
+    };
+
+    const setSceneAudio = async (sceneIndex, audioUrl, audioFileName, audioSource) => {
+        const audioDuration = await getAudioDuration(audioUrl);
         setScenes(prev => prev.map((scene, index) => {
             if (index !== sceneIndex) return scene;
             if (scene.audioUrl && scene.audioUrl.startsWith('blob:')) {
                 URL.revokeObjectURL(scene.audioUrl);
             }
+            const endHold = Number(scene.endHold ?? 0.5) || 0;
+            const duration = audioDuration ? getVoiceLedDuration(audioDuration, endHold) : scene.duration;
             return {
                 ...scene,
                 audioUrl,
                 audioFileName,
                 audioSource,
+                audioDuration,
+                endHold,
+                duration,
+                videoPrompt: generateVideoPrompt({ ...scene, audioUrl, audioFileName, audioSource, audioDuration, endHold, duration }),
                 isGeneratingAudio: false
             };
         }));
+        if (audioDuration) {
+            addLog('SUCCESS', `Scene ${sceneIndex + 1} duration auto-set to ${getVoiceLedDuration(audioDuration, scenes[sceneIndex]?.endHold ?? 0.5)}s from voiceover (${formatSeconds(audioDuration)} + hold).`);
+        }
     };
 
     const handleSceneAudioUpload = (sceneIndex, file) => {
@@ -2598,20 +2694,21 @@ Guidelines:
         });
     };
 
-    const generateNarratorAudio = async (sceneIndex) => {
+    const generateNarratorAudio = async (sceneIndex, options = {}) => {
+        const { suppressAlerts = false } = options;
         const scene = scenes[sceneIndex];
         const narratorScript = scene?.narratorScript?.trim() || scene?.dialogue?.trim() || scene?.text?.trim();
         const selectedVoiceId = normalizeVoiceId(scene?.voiceId);
         const selectedVibe = scene?.voiceVibe || 'Neutral';
 
         if (!openAIKey.trim() && !canUseServerApiKeys()) {
-            alert('Please enter your OpenAI API key for narrator audio.');
+            if (!suppressAlerts) alert('Please enter your OpenAI API key for narrator audio.');
             addLog('ERROR', `Scene ${sceneIndex + 1} audio generation blocked: missing OpenAI API key.`);
             return;
         }
 
         if (!narratorScript) {
-            alert('Add narrator script or dialogue before generating voiceover.');
+            if (!suppressAlerts) alert('Add narrator script or dialogue before generating voiceover.');
             addLog('ERROR', `Scene ${sceneIndex + 1} audio generation blocked: empty narrator script.`);
             return;
         }
@@ -2652,7 +2749,7 @@ Guidelines:
             const audioBlob = await response.blob();
             const audioUrl = URL.createObjectURL(audioBlob);
             const audioFileName = `scene_${sceneIndex + 1}_${selectedVoiceId}_${selectedVibe.toLowerCase()}.mp3`;
-            setSceneAudio(sceneIndex, audioUrl, audioFileName, 'tts-1');
+            await setSceneAudio(sceneIndex, audioUrl, audioFileName, 'tts-1');
             addLog('SUCCESS', `Scene ${sceneIndex + 1} AI narrator audio generated (${(audioBlob.size / 1024).toFixed(1)} KB).`);
         } catch (error) {
             if (error.name === 'AbortError') {
@@ -2660,7 +2757,7 @@ Guidelines:
             } else {
                 console.error('Narrator audio generation error:', error);
                 addLog('ERROR', `Scene ${sceneIndex + 1} audio generation failed: ${error.message}`);
-                alert(`Audio generation failed: ${error.message}`);
+                if (!suppressAlerts) alert(`Audio generation failed: ${error.message}`);
             }
             setScenes(prev => prev.map((item, index) => (
                 index === sceneIndex ? { ...item, isGeneratingAudio: false } : item
@@ -2668,6 +2765,48 @@ Guidelines:
         } finally {
             audioAbortControllersRef.current.delete(sceneIndex);
         }
+    };
+
+    const generateAllNarratorAudio = async () => {
+        if (!openAIKey.trim() && !canUseServerApiKeys()) {
+            alert('Please enter your OpenAI API key for narrator audio.');
+            addLog('ERROR', 'Batch voiceover generation blocked: missing OpenAI API key.');
+            return;
+        }
+
+        const sceneIndexesWithScript = scenes
+            .map((scene, index) => ({
+                index,
+                script: scene?.narratorScript?.trim() || scene?.dialogue?.trim() || scene?.text?.trim()
+            }))
+            .filter(({ index, script }) => script && !audioAbortControllersRef.current.has(index))
+            .map(({ index }) => index);
+
+        if (sceneIndexesWithScript.length === 0) {
+            alert('Add narrator scripts or dialogue before generating all voiceovers.');
+            addLog('ERROR', 'Batch voiceover generation blocked: no scenes have narrator text.');
+            return;
+        }
+
+        const skippedCount = scenes.length - sceneIndexesWithScript.length;
+        setIsGeneratingAllAudio(true);
+        addLog('API_CALL', `Generating voiceover for ${sceneIndexesWithScript.length} scene(s) at once${skippedCount ? `, skipping ${skippedCount} scene(s)` : ''}.`);
+
+        try {
+            await Promise.allSettled(sceneIndexesWithScript.map(index => generateNarratorAudio(index, { suppressAlerts: true })));
+            addLog('SUCCESS', `Batch voiceover generation finished for ${sceneIndexesWithScript.length} scene(s).`);
+            showCopyFeedback('All voiceovers generated!');
+        } finally {
+            setIsGeneratingAllAudio(false);
+        }
+    };
+
+    const cancelAllAudioGeneration = () => {
+        audioAbortControllersRef.current.forEach(controller => controller.abort());
+        audioAbortControllersRef.current.clear();
+        setIsGeneratingAllAudio(false);
+        setScenes(prev => prev.map(scene => ({ ...scene, isGeneratingAudio: false })));
+        addLog('SUCCESS', 'Cancelled all running voiceover generation.');
     };
 
     // ── Asset Tray helpers ──────────────────────────────────────────────────
@@ -3547,8 +3686,57 @@ Guidelines:
                                                 onChange={(e) => updateSceneField(voIdx, 'narratorScript', e.target.value)}
                                             />
 
+                                            {/* Whole-video voice setting */}
+                                            <div className="rounded-2xl bg-purple-500/10 border border-purple-500/30 p-4 mb-4">
+                                                <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+                                                    <div>
+                                                        <h3 className="text-sm font-black text-purple-200">Whole Video Voice</h3>
+                                                        <p className="text-[11px] text-slate-400 mt-0.5">Use one voice and vibe across every scene.</p>
+                                                    </div>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        <button onClick={applyGlobalVoiceToAllScenes} disabled={scenes.length === 0 || isGeneratingAllAudio} className="rounded-xl bg-purple-600 hover:bg-purple-700 disabled:opacity-50 px-3 py-2 text-xs font-bold transition">
+                                                            Apply to All Scenes
+                                                        </button>
+                                                        <button onClick={generateAllNarratorAudio} disabled={scenes.length === 0 || isGeneratingAllAudio} className="rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 px-3 py-2 text-xs font-bold transition">
+                                                            {isGeneratingAllAudio ? 'Generating All...' : 'Generate All Voiceovers'}
+                                                        </button>
+                                                        {isGeneratingAllAudio && (
+                                                            <button onClick={cancelAllAudioGeneration} className="rounded-xl bg-red-500/20 text-red-200 border border-red-500/40 hover:border-red-400 px-3 py-2 text-xs font-bold transition">
+                                                                Cancel All
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                <div className="grid sm:grid-cols-[1fr_auto] gap-3">
+                                                    <div className="grid grid-cols-3 gap-2">
+                                                        {VOICE_CONFIG.map(voice => {
+                                                            const active = normalizeVoiceId(globalVoiceId) === voice.id;
+                                                            const playing = playingVoiceSample === voice.id;
+                                                            return (
+                                                                <div key={voice.id} onClick={() => setGlobalVoiceId(voice.id)} className={`rounded-xl border p-2 cursor-pointer transition ${active ? 'border-purple-400 bg-purple-500/20' : 'border-slate-700 bg-slate-900/70 hover:border-purple-400/50'}`}>
+                                                                    <div className="flex items-center justify-between gap-1">
+                                                                        <span className="text-base">{voice.emoji}</span>
+                                                                        <button type="button" onClick={(e) => { e.stopPropagation(); playVoiceSample(voice); }} className={`w-7 h-7 rounded-lg border text-xs ${playing ? 'bg-purple-500/30 border-purple-400 text-purple-100' : 'bg-slate-800 border-slate-700 text-slate-300 hover:border-purple-400'}`}>
+                                                                            {playing ? '❚❚' : '🔊'}
+                                                                        </button>
+                                                                    </div>
+                                                                    <p className="text-xs font-bold text-white mt-1">{voice.name}</p>
+                                                                    <p className="text-[10px] text-slate-500">{voice.style}</p>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                    <div className="flex sm:flex-col gap-2">
+                                                        <label className="text-[10px] font-semibold text-slate-400 sm:block hidden">Global Vibe</label>
+                                                        <select className="studio-input p-2 text-xs min-w-36" value={globalVoiceVibe} onChange={(e) => setGlobalVoiceVibe(e.target.value)}>
+                                                            {VIBE_OPTIONS.map(v => <option key={v} value={v}>{v}</option>)}
+                                                        </select>
+                                                    </div>
+                                                </div>
+                                            </div>
+
                                             {/* Voice selector */}
-                                            <label className="text-xs font-semibold text-slate-400 block mb-2">Voice</label>
+                                            <label className="text-xs font-semibold text-slate-400 block mb-2">Scene Voice Override</label>
                                             <div className="grid grid-cols-3 gap-3 mb-4">
                                                 {VOICE_CONFIG.map(voice => {
                                                     const active = normalizeVoiceId(voScene.voiceId) === voice.id;
@@ -3584,6 +3772,40 @@ Guidelines:
                                                     Upload Audio Override
                                                     <input type="file" accept="audio/*" className="hidden" onChange={(e) => handleSceneAudioUpload(voIdx, e.target.files?.[0])} />
                                                 </label>
+                                            </div>
+
+                                            {/* Voice-led timing */}
+                                            <div className="rounded-2xl bg-slate-950/70 border border-slate-700/50 p-3 mb-4">
+                                                <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
+                                                    <div>
+                                                        <p className="text-xs font-bold text-cyan-200">Voice-Led Timing</p>
+                                                        <p className="text-[11px] text-slate-500">Scene length follows the voiceover, then adds a quiet visual hold.</p>
+                                                    </div>
+                                                    <div className="text-right">
+                                                        <p className="text-[10px] text-slate-500">Scene Duration</p>
+                                                        <p className="text-lg font-black text-white">{formatSeconds(voScene.duration || 0)}</p>
+                                                    </div>
+                                                </div>
+                                                <div className="grid sm:grid-cols-3 gap-2 text-xs">
+                                                    <div className="rounded-xl bg-slate-900/80 border border-slate-700/60 p-2">
+                                                        <p className="text-[10px] text-slate-500">Voiceover</p>
+                                                        <p className="font-bold text-purple-200">{voScene.audioDuration ? formatSeconds(voScene.audioDuration) : 'No audio yet'}</p>
+                                                    </div>
+                                                    <div className="rounded-xl bg-slate-900/80 border border-slate-700/60 p-2">
+                                                        <p className="text-[10px] text-slate-500 mb-1">End Hold</p>
+                                                        <select className="studio-input w-full p-1.5 text-xs" value={voScene.endHold ?? 0.5} onChange={(e) => updateSceneEndHold(voIdx, e.target.value)}>
+                                                            {END_HOLD_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                                                        </select>
+                                                    </div>
+                                                    <div className="rounded-xl bg-slate-900/80 border border-slate-700/60 p-2">
+                                                        <p className="text-[10px] text-slate-500">Export Audio</p>
+                                                        <p className="font-bold text-emerald-200">Voice only</p>
+                                                        <p className="text-[10px] text-slate-500">Video sound muted</p>
+                                                    </div>
+                                                </div>
+                                                {voScene.videoUrl && voScene.audioDuration && (
+                                                    <p className="text-[10px] text-yellow-200/80 mt-2">If this scene was animated before the voiceover timing changed, regenerate the scene video for the smoothest hold.</p>
+                                                )}
                                             </div>
 
                                             {/* Generate button + audio player */}
