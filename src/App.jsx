@@ -93,11 +93,14 @@ const removeKlingNegativeTerms = (prompt) => prompt
 
 const IMAGE_MODEL_CONFIGS = {
     nanoBanana2: {
-        label: 'NanoBanana 2',
-        modelId: 'gemini-2.5-flash-image',
+        label: 'Gemini 2.0 Flash Image',
+        modelId: 'gemini-2.0-flash-preview-image-generation',
         candidateModelIds: [
             'gemini-2.5-flash-image',
-            'gemini-3-pro-image'
+            'gemini-3-pro-image-preview',
+            'gemini-2.0-flash-preview-image-generation',
+            'gemini-2.0-flash-exp-image-generation',
+            'gemini-2.0-flash-exp'
         ],
         quality: 'standard',
         steps: 'minimum',
@@ -110,11 +113,14 @@ const IMAGE_MODEL_CONFIGS = {
         mode: 'flash'
     },
     nanoBananaPro: {
-        label: 'NanoBanana Pro',
-        modelId: 'gemini-3-pro-image',
+        label: 'Gemini 2.0 Flash Image',
+        modelId: 'gemini-2.0-flash-preview-image-generation',
         candidateModelIds: [
-            'gemini-3-pro-image',
-            'gemini-2.5-flash-image'
+            'gemini-2.5-flash-image',
+            'gemini-3-pro-image-preview',
+            'gemini-2.0-flash-preview-image-generation',
+            'gemini-2.0-flash-exp-image-generation',
+            'gemini-2.0-flash-exp'
         ],
         quality: 'high',
         steps: 'standard',
@@ -128,7 +134,21 @@ const IMAGE_MODEL_CONFIGS = {
     }
 };
 
+const GEMINI_IMAGE_MODEL_PREFERENCE = [
+    'gemini-2.5-flash-image',
+    'gemini-3-pro-image-preview',
+    'gemini-2.0-flash-preview-image-generation',
+    'gemini-2.0-flash-exp-image-generation',
+    'gemini-2.0-flash-exp'
+];
+
+const KIE_IMAGE_MODEL_BY_APP_MODEL = {
+    nanoBanana2: 'google/nano-banana',
+    nanoBananaPro: 'google/nano-banana-pro'
+};
+
 const getImageModelConfig = (selectedModel) => IMAGE_MODEL_CONFIGS[selectedModel] || IMAGE_MODEL_CONFIGS.nanoBanana2;
+const getImageModelLabel = (selectedModel) => getImageModelConfig(selectedModel).label;
 
 const compressPromptForFastImageModel = (prompt) => {
     const repeatedStyleTerms = [
@@ -173,17 +193,50 @@ const transformImagePromptForModel = (prompt, selectedModel) => {
 const getOrCreateImageSeed = (scene, sceneIndex) => scene?.imageSeed || Math.floor((Date.now() + sceneIndex) % 2147483647);
 
 const extractGeneratedImageUrl = (data) => {
-    const part = data?.candidates?.[0]?.content?.parts?.[0];
-    const textContent = part?.text || '';
-    const urlMatch = textContent.match(/https?:\/\/\S+/);
+    const parts = data?.candidates?.[0]?.content?.parts || [];
 
-    return part?.fileData?.fileUri ||
-        part?.fileData?.uri ||
-        part?.file_data?.file_uri ||
-        part?.file_data?.uri ||
-        part?.image?.url ||
-        part?.url ||
-        (urlMatch ? urlMatch[0].replace(/[)"'\]]+$/, '') : null);
+    for (const part of parts) {
+        const textContent = part?.text || '';
+        const urlMatch = textContent.match(/https?:\/\/\S+/);
+        const imageUrl = part?.fileData?.fileUri ||
+            part?.fileData?.uri ||
+            part?.file_data?.file_uri ||
+            part?.file_data?.uri ||
+            part?.image?.url ||
+            part?.url ||
+            (urlMatch ? urlMatch[0].replace(/[)"'\]]+$/, '') : null);
+
+        if (imageUrl) return imageUrl;
+    }
+
+    return null;
+};
+
+const extractKieTaskId = (data) => data?.task_id ||
+    data?.taskId ||
+    data?.id ||
+    data?.request_id ||
+    data?.data?.taskId ||
+    data?.data?.task_id ||
+    data?.data?.id;
+
+const extractKieResultUrls = (taskData) => {
+    const resultJson = taskData?.resultJson || taskData?.result_json;
+    if (typeof resultJson === 'string') {
+        try {
+            const parsed = JSON.parse(resultJson);
+            if (Array.isArray(parsed.resultUrls)) return parsed.resultUrls;
+            if (Array.isArray(parsed.result_urls)) return parsed.result_urls;
+        } catch {
+            return [];
+        }
+    }
+
+    return taskData?.resultUrls ||
+        taskData?.result_urls ||
+        taskData?.response?.resultUrls ||
+        taskData?.response?.result_urls ||
+        [];
 };
 
 const transformVideoPrompt = (originalPrompt, selectedModel) => {
@@ -330,6 +383,7 @@ export default function App() {
     const ffmpegLoadPromiseRef = useRef(null);
     const activeImageGenTimersRef = useRef(new Map());
     const imageAbortControllersRef = useRef(new Map());
+    const geminiImageModelsCacheRef = useRef(null);
     const imageBatchCancelRef = useRef(false);
     const videoAbortControllersRef = useRef(new Map());
     const videoPollingIntervalsRef = useRef(new Map());
@@ -874,13 +928,15 @@ Guidelines:
     const generateSceneImage = async (sceneIndex, options = {}) => {
         const scene = scenes[sceneIndex];
         const currentKey = geminiKey;
+        const currentKieKey = kieAiKey;
         const selectedImageModel = options.forceImageModel || activeImageModel;
         const imageModelConfig = getImageModelConfig(selectedImageModel);
         const isFastImageModel = selectedImageModel === 'nanoBanana2';
+        const canUseKieForImages = currentKieKey.trim() || canUseServerApiKeys();
 
-        if (!currentKey.trim() && !canUseServerApiKeys()) {
-            addLog('ERROR', `Scene ${sceneIndex + 1} image generation blocked: missing Gemini API key.`);
-            throw new Error('Gemini API key required for image generation');
+        if (!canUseKieForImages && !currentKey.trim()) {
+            addLog('ERROR', `Scene ${sceneIndex + 1} image generation blocked: missing Kie.ai or Gemini API key.`);
+            throw new Error('Kie.ai or Gemini API key required for image generation');
         }
 
         if (imageAbortControllersRef.current.has(sceneIndex)) {
@@ -923,7 +979,8 @@ Guidelines:
         try {
             const startedAt = performance.now();
             const modelId = imageModelConfig.modelId;
-            const candidateModelIds = [...new Set(imageModelConfig.candidateModelIds || [modelId])];
+            const configuredCandidateModelIds = [...new Set(imageModelConfig.candidateModelIds || [modelId])];
+            let candidateModelIds = configuredCandidateModelIds;
             const timeoutMs = imageModelConfig.timeoutMs;
             const buildImageParts = (useSimplifiedPrompt = false) => {
                 const promptText = useSimplifiedPrompt
@@ -970,6 +1027,206 @@ Guidelines:
                 imageAbortController.signal.addEventListener('abort', onAbort, { once: true });
             });
 
+            const pollKieImageTask = async (taskId, requestTimeoutMs) => {
+                const deadline = Date.now() + requestTimeoutMs;
+                let pollCount = 0;
+
+                while (Date.now() < deadline) {
+                    await waitForImageRetry(pollCount === 0 ? 2500 : 4000);
+                    pollCount += 1;
+
+                    const pollResponse = await fetch(`/kie-proxy/api/v1/jobs/recordInfo?taskId=${encodeURIComponent(taskId)}`, {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${currentKieKey}`
+                        },
+                        signal: imageAbortController.signal
+                    });
+                    const pollData = await pollResponse.json();
+
+                    if (!pollResponse.ok || (pollData.code && pollData.code !== 200)) {
+                        throw new Error(`Kie.ai image poll failed (${pollResponse.status}): ${pollData.msg || pollData.message || JSON.stringify(pollData)}`);
+                    }
+
+                    const taskData = pollData.data || {};
+                    const state = String(taskData.state || taskData.status || '').toLowerCase();
+                    const progress = Number(taskData.progress);
+                    if (Number.isFinite(progress)) {
+                        setScenes(prevScenes => prevScenes.map((item, index) => (
+                            index === sceneIndex
+                                ? { ...item, imageProgress: Math.max(item.imageProgress || 0, Math.min(progress, 95)), imageStatusText: 'Kie.ai is rendering the frame...' }
+                                : item
+                        )));
+                    } else {
+                        setScenes(prevScenes => prevScenes.map((item, index) => (
+                            index === sceneIndex
+                                ? { ...item, imageProgress: Math.min((item.imageProgress || 10) + 8, 92), imageStatusText: 'Kie.ai is rendering the frame...' }
+                                : item
+                        )));
+                    }
+
+                    addLog('POLLING', `Poll #${pollCount}: Scene ${sceneIndex + 1} Kie.ai image task ${taskId} state=${state || 'unknown'}.`);
+
+                    if (state === 'success' || state === 'completed') {
+                        const resultUrls = extractKieResultUrls(taskData);
+                        const imageUrl = resultUrls[0] ||
+                            taskData.imageUrl ||
+                            taskData.image_url ||
+                            taskData.url ||
+                            taskData.response?.imageUrl ||
+                            taskData.response?.image_url;
+
+                        if (!imageUrl) {
+                            throw new Error(`Kie.ai image task completed but no image URL was found. Response: ${JSON.stringify(taskData)}`);
+                        }
+
+                        return imageUrl;
+                    }
+
+                    if (state === 'fail' || state === 'failed' || state === 'error') {
+                        throw new Error(`Kie.ai image task failed: ${taskData.failMsg || taskData.fail_msg || pollData.msg || 'Unknown error'}`);
+                    }
+                }
+
+                throw new Error(`Kie.ai image task timed out after ${Math.round(requestTimeoutMs / 1000)}s`);
+            };
+
+            const requestKieSceneImage = async () => {
+                const kieModel = KIE_IMAGE_MODEL_BY_APP_MODEL[selectedImageModel] || KIE_IMAGE_MODEL_BY_APP_MODEL.nanoBanana2;
+                const promptText = submittedImagePrompt;
+                let referenceImageUrls = [];
+
+                if (nanoBananaStyleRef && referenceImage) {
+                    const kieReferenceImage = await normalizeImageForKie(referenceImage);
+                    referenceImageUrls = [await getKieImageUrl(kieReferenceImage, sceneIndex, imageAbortController.signal)];
+                }
+
+                const requestBody = selectedImageModel === 'nanoBananaPro'
+                    ? {
+                        model: kieModel,
+                        input: {
+                            prompt: promptText,
+                            ...(referenceImageUrls.length > 0 ? { image_input: referenceImageUrls } : {}),
+                            aspect_ratio: '9:16',
+                            resolution: imageModelConfig.upscale ? '2K' : '1K',
+                            output_format: 'png'
+                        }
+                    }
+                    : {
+                        model: referenceImageUrls.length > 0 ? 'google/nano-banana-edit' : kieModel,
+                        input: {
+                            prompt: promptText,
+                            ...(referenceImageUrls.length > 0 ? { image_urls: referenceImageUrls } : {}),
+                            output_format: 'png',
+                            image_size: '9:16',
+                            nsfw_checker: true
+                        }
+                    };
+
+                addLog('API_CALL', `Submitting Scene ${sceneIndex + 1} image to Kie.ai. Model=${requestBody.model}. Timeout=${Math.round(timeoutMs / 1000)}s. Prompt: ${promptText}`);
+                addLog('API_CALL', `Kie.ai image request payload for Scene ${sceneIndex + 1}:\n${JSON.stringify(requestBody, null, 2)}`);
+
+                const submitResponse = await fetch('/kie-proxy/api/v1/jobs/createTask', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${currentKieKey}`
+                    },
+                    signal: imageAbortController.signal,
+                    body: JSON.stringify(requestBody)
+                });
+                const submitData = await submitResponse.json();
+                addLog('API_CALL', `Kie.ai image submit response for Scene ${sceneIndex + 1}: ${JSON.stringify(submitData, null, 2)}`);
+
+                if (!submitResponse.ok || (submitData.code && submitData.code !== 200)) {
+                    throw new Error(`Kie.ai image submit failed (${submitResponse.status}): ${submitData.msg || submitData.message || JSON.stringify(submitData)}`);
+                }
+
+                const taskId = extractKieTaskId(submitData);
+                if (!taskId) {
+                    throw new Error(`No Kie.ai image task ID received. Response: ${JSON.stringify(submitData)}`);
+                }
+
+                addLog('SUCCESS', `Kie.ai image task submitted for Scene ${sceneIndex + 1}. Task ID: ${taskId}`);
+                return pollKieImageTask(taskId, timeoutMs);
+            };
+
+            if (canUseKieForImages) {
+                const imageUrl = await requestKieSceneImage();
+                const firstPixelSeconds = ((performance.now() - startedAt) / 1000).toFixed(1);
+
+                setScenes(prevScenes => prevScenes.map((item, index) => (
+                    index === sceneIndex
+                        ? {
+                            ...item,
+                            generatedImage: imageUrl,
+                            generatedImageModel: selectedImageModel,
+                            imageSeed,
+                            imageProgress: 100,
+                            imageStatusText: null,
+                            isGenerating: false,
+                            error: null
+                        }
+                        : item
+                )));
+                addLog('SUCCESS', `Kie.ai ${imageModelConfig.label} | Prompt Length: ${submittedImagePrompt.length} | Time to Image URL: ${firstPixelSeconds} seconds`);
+                addLog('SUCCESS', `Scene ${sceneIndex + 1} Image Generated in ${firstPixelSeconds}s. URL: ${imageUrl}`);
+                return { success: true, index: sceneIndex };
+            }
+
+            const resolveCandidateImageModelIds = async () => {
+                const cacheKey = currentKey.trim() || 'server';
+                if (geminiImageModelsCacheRef.current?.cacheKey === cacheKey) {
+                    return geminiImageModelsCacheRef.current.modelIds;
+                }
+
+                try {
+                    const listModelsUrl = `/gemini-proxy/v1beta/models${currentKey.trim() ? `?key=${encodeURIComponent(currentKey.trim())}` : ''}`;
+                    const listResponse = await fetchWithTimeout(listModelsUrl, {
+                        signal: imageAbortController.signal
+                    }, 30000);
+
+                    if (!listResponse.ok) {
+                        const listData = await listResponse.json().catch(() => ({}));
+                        addLog('ERROR', `Could not list Gemini models (${listResponse.status}): ${listData.error?.message || 'Unknown error'}. Using built-in image model fallback list.`);
+                        return configuredCandidateModelIds;
+                    }
+
+                    const listData = await listResponse.json();
+                    const generateContentModels = (listData.models || [])
+                        .map(model => ({
+                            ...model,
+                            id: String(model.name || '').replace(/^models\//, '')
+                        }))
+                        .filter(model => (model.supportedGenerationMethods || []).includes('generateContent'));
+
+                    const availableIds = new Set(generateContentModels.map(model => model.id));
+                    const preferredAvailableIds = GEMINI_IMAGE_MODEL_PREFERENCE.filter(modelId => availableIds.has(modelId));
+                    const discoveredImageIds = generateContentModels
+                        .map(model => model.id)
+                        .filter(modelId => (
+                            GEMINI_IMAGE_MODEL_PREFERENCE.includes(modelId) ||
+                            /image|image-generation/i.test(modelId)
+                        ));
+                    const modelIds = [...new Set([...preferredAvailableIds, ...discoveredImageIds])];
+
+                    if (modelIds.length === 0) {
+                        addLog('ERROR', 'Gemini models.list returned no image-capable generateContent models for this API key. Using built-in image model fallback list.');
+                        return configuredCandidateModelIds;
+                    }
+
+                    geminiImageModelsCacheRef.current = { cacheKey, modelIds };
+                    addLog('API_CALL', `Available Gemini image model(s): ${modelIds.join(', ')}. Using ${modelIds[0]} first.`);
+                    return modelIds;
+                } catch (error) {
+                    if (error.message === USER_CANCELLED_REQUEST) throw error;
+                    addLog('ERROR', `Could not list Gemini models: ${error.message}. Using built-in image model fallback list.`);
+                    return configuredCandidateModelIds;
+                }
+            };
+
+            candidateModelIds = await resolveCandidateImageModelIds();
+
             const requestNanoBananaImage = async (imageParts, requestTimeoutMs, attemptLabel, candidateModelId = modelId) => {
                 const promptText = imageParts[imageParts.length - 1]?.text || scene.frameDescription;
                 const timerLabel = `[Image API] Scene ${sceneIndex + 1} ${imageModelConfig.label} ${attemptLabel} ${candidateModelId}`;
@@ -986,7 +1243,7 @@ Guidelines:
                         body: JSON.stringify({
                             contents: [{ parts: imageParts }],
                             generationConfig: {
-                                responseModalities: ["IMAGE"],
+                                responseModalities: ["TEXT", "IMAGE"],
                                 seed: imageSeed
                             }
                         })
@@ -1019,6 +1276,7 @@ Guidelines:
 
                         const errorMessage = candidateData.error?.message || '';
                         const isTransient = transientStatusCodes.has(candidateResponse.status);
+                        const isAccessDenied = candidateResponse.status === 403 && /access|denied|permission|not authorized/i.test(errorMessage);
                         const canRetrySameModel = isTransient && attemptIndex < retryDelays.length;
 
                         if (canRetrySameModel) {
@@ -1029,12 +1287,13 @@ Guidelines:
                         }
 
                         const canTryNextModel = (
+                            isAccessDenied ||
                             (candidateResponse.status === 404 && /not found|not supported/i.test(errorMessage)) ||
                             isTransient
                         );
 
                         if (canTryNextModel && candidateModelId !== candidateModelIds[candidateModelIds.length - 1]) {
-                            addLog('ERROR', `${candidateModelId} is unavailable or overloaded for image generation. Trying next Gemini image model.`);
+                            addLog('ERROR', `${candidateModelId} is unavailable for image generation (${candidateResponse.status}${errorMessage ? `: ${errorMessage}` : ''}). Trying next Gemini image model.`);
                         }
 
                         if (!canTryNextModel) {
@@ -1061,7 +1320,7 @@ Guidelines:
                 if (!isFastImageModel || !error.message.includes('timed out')) {
                     throw error;
                 }
-                addLog('ERROR', `Scene ${sceneIndex + 1} full prompt timed out on NanoBanana 2. Retrying once with compressed prompt.`);
+                addLog('ERROR', `Scene ${sceneIndex + 1} full prompt timed out on ${imageModelConfig.label}. Retrying once with compressed prompt.`);
                 ({ response, data, resolvedModelId } = await requestImageWithModelFallback(buildImageParts(true), 120000, 'compressed retry'));
             }
 
@@ -1072,7 +1331,7 @@ Guidelines:
                     throw new Error('Rate Limit Hit');
                 }
                 if (response.status === 503) {
-                    throw new Error(`Gemini image model is temporarily overloaded after retries (${resolvedModelId}). Please try again in a few minutes or switch to NanoBanana Pro.`);
+                    throw new Error(`Gemini image model is temporarily overloaded after retries (${resolvedModelId}). Please try again in a few minutes.`);
                 }
                 throw new Error(`API Error (${response.status}) using ${resolvedModelId}: ${data.error?.message || 'Unknown error'}`);
             }
@@ -1080,23 +1339,24 @@ Guidelines:
             // Check multiple possible response formats
             const imageUrl = extractGeneratedImageUrl(data);
             let imageData = null;
+            const responseParts = data.candidates?.[0]?.content?.parts || [];
             
             // Format 1: inlineData (camelCase) - THIS IS THE CORRECT ONE
-            imageData = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+            imageData = responseParts.find(part => part?.inlineData?.data)?.inlineData?.data;
             
             // Format 2: inline_data (snake_case)
             if (!imageData) {
-                imageData = data.candidates?.[0]?.content?.parts?.[0]?.inline_data?.data;
+                imageData = responseParts.find(part => part?.inline_data?.data)?.inline_data?.data;
             }
             
             // Format 3: direct image data
             if (!imageData) {
-                imageData = data.candidates?.[0]?.content?.parts?.[0]?.image?.data;
+                imageData = responseParts.find(part => part?.image?.data)?.image?.data;
             }
             
             // Format 4: text response with base64
             if (!imageData) {
-                const textContent = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                const textContent = responseParts.find(part => part?.text?.includes('base64'))?.text;
                 if (textContent && textContent.includes('base64')) {
                     imageData = textContent;
                 }
@@ -1107,7 +1367,7 @@ Guidelines:
             if (imageUrl || imageData) {
                 const firstPixelSeconds = ((performance.now() - startedAt) / 1000).toFixed(1);
                 const generatedImage = imageUrl || (() => {
-                    const mimeType = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.mimeType || 'image/jpeg';
+                    const mimeType = responseParts.find(part => part?.inlineData?.mimeType)?.inlineData?.mimeType || 'image/jpeg';
                     return imageData.startsWith('data:') ? imageData : `data:${mimeType};base64,${imageData}`;
                 })();
 
@@ -1172,7 +1432,7 @@ Guidelines:
 
         const prompt = scene.imagePrompt?.trim() || buildImagePromptForScene(scene);
         const seed = getOrCreateImageSeed(scene, sceneIndex);
-        addLog('API_CALL', `Redo with Pro requested for Scene ${sceneIndex + 1}. Reusing prompt and seed=${seed}.`);
+        addLog('API_CALL', `Refined image redo requested for Scene ${sceneIndex + 1}. Reusing prompt and seed=${seed}.`);
         generateSceneImageSafely(sceneIndex, {
             forceImageModel: 'nanoBananaPro',
             prompt,
@@ -1233,8 +1493,8 @@ Guidelines:
 
     // Generate all images with chunked parallelism
     const generateAllImages = async () => {
-        if (!geminiKey.trim() && !canUseServerApiKeys()) {
-            alert('Please enter your Gemini API key for image generation');
+        if (!kieAiKey.trim() && !geminiKey.trim() && !canUseServerApiKeys()) {
+            alert('Please enter your Kie.ai or Gemini API key for image generation');
             return;
         }
 
@@ -1258,7 +1518,7 @@ Guidelines:
         const DELAY_BETWEEN_CHUNKS = imageModelConfig.chunkDelayMs;
         
         console.log(`🚀 Starting batch generation: ${sceneIndices.length} images in chunks of ${CHUNK_SIZE}`);
-        addLog('API_CALL', `Starting NanoBanana batch generation: ${sceneIndices.length} pending image(s), ${CHUNK_SIZE} parallel per batch, ${DELAY_BETWEEN_CHUNKS}ms delay between batches.`);
+        addLog('API_CALL', `Starting image batch generation: ${sceneIndices.length} pending image(s), ${CHUNK_SIZE} parallel per batch, ${DELAY_BETWEEN_CHUNKS}ms delay between batches.`);
         
         try {
             const results = await processInChunks(
@@ -2390,13 +2650,7 @@ Guidelines:
             byCategory.video[videoStatus] += PTS_COST.video;
             byCategory.voiceover[audioStatus] += PTS_COST.voiceover;
 
-            const imageModelLabel = scene.generatedImageModel === 'nanoBananaPro'
-                ? 'NanoBanana Pro'
-                : scene.generatedImageModel === 'nanoBanana2'
-                    ? 'NanoBanana 2'
-                    : activeImageModel === 'nanoBananaPro'
-                        ? 'NanoBanana Pro'
-                        : 'NanoBanana 2';
+            const imageModelLabel = getImageModelLabel(scene.generatedImageModel || activeImageModel);
             const videoModelLabel = scene.videoEngine
                 ? (VIDEO_MODEL_CONFIGS[scene.videoEngine]?.label || scene.videoEngine)
                 : (VIDEO_MODEL_CONFIGS[activeVideoEngine]?.label || activeVideoEngine);
@@ -3222,7 +3476,7 @@ Guidelines:
                                         <div className="flex gap-1">
                                             {scene.generatedImage && <button onClick={() => downloadImage(scene.generatedImage, `scene_${index + 1}.png`)} className="flex-1 bg-slate-800 hover:bg-slate-700 rounded-lg py-1.5 text-[10px] transition" title="Save">💾</button>}
                                             {scene.generatedImageModel === 'nanoBanana2' && !scene.isGenerating && (
-                                                <button onClick={() => redoSceneImageWithPro(index)} className="flex-1 bg-yellow-500/10 hover:bg-yellow-500/20 border border-yellow-400/20 text-yellow-200 rounded-lg py-1.5 text-[10px] font-semibold transition" title="Redo with Pro">✨ Pro</button>
+                                                <button onClick={() => redoSceneImageWithPro(index)} className="flex-1 bg-yellow-500/10 hover:bg-yellow-500/20 border border-yellow-400/20 text-yellow-200 rounded-lg py-1.5 text-[10px] font-semibold transition" title="Redo with refinement">✨ Refine</button>
                                             )}
                                         </div>
                                     </div>
@@ -3484,7 +3738,7 @@ Guidelines:
                                         <p className="text-xs text-orange-100/80 mt-1">Create a frame for this scene</p>
                                     </button>
                                     {selectedScene?.isGenerating && <button onClick={() => cancelSceneImageGeneration(selectedSceneIndex)} className="mt-3 inline-flex items-center gap-2 rounded-xl bg-black/25 hover:bg-black/40 px-3 py-2 text-xs font-bold transition"><XCircle size={16} /> Cancel</button>}
-                                    {selectedScene?.generatedImageModel === 'nanoBanana2' && !selectedScene?.isGenerating && <button onClick={() => redoSceneImageWithPro(selectedSceneIndex)} className="mt-3 inline-flex items-center gap-2 rounded-xl bg-yellow-400/15 text-yellow-100 border border-yellow-300/30 hover:border-yellow-200 px-3 py-2 text-xs font-bold transition">✨ Redo with Pro</button>}
+                                    {selectedScene?.generatedImageModel === 'nanoBanana2' && !selectedScene?.isGenerating && <button onClick={() => redoSceneImageWithPro(selectedSceneIndex)} className="mt-3 inline-flex items-center gap-2 rounded-xl bg-yellow-400/15 text-yellow-100 border border-yellow-300/30 hover:border-yellow-200 px-3 py-2 text-xs font-bold transition">✨ Redo Refined</button>}
                                 </div>
                                 <label className="rounded-2xl bg-purple-500/15 border border-purple-500/30 hover:border-purple-400/70 p-4 text-left transition cursor-pointer">
                                     <div className="text-2xl mb-3">🖼️</div>
@@ -3986,8 +4240,8 @@ Guidelines:
                                         <option value="gemini">Gemini (gemini-1.5-pro)</option>
                                     </select>
                                     <select className="studio-input p-3 text-sm" value={activeImageModel} onChange={(e) => setActiveImageModel(e.target.value)}>
-                                        <option value="nanoBanana2">NanoBanana 2 (Fast)</option>
-                                        <option value="nanoBananaPro">NanoBanana Pro</option>
+                                        <option value="nanoBanana2">Gemini 2.0 Flash Image (Fast)</option>
+                                        <option value="nanoBananaPro">Gemini 2.0 Flash Image (Refined Prompt)</option>
                                     </select>
                                     <select className="studio-input p-3 text-sm sm:col-span-2" value={activeVideoEngine} onChange={(e) => setActiveVideoEngine(e.target.value)}>
                                         {Object.entries(VIDEO_MODEL_CONFIGS).map(([value, config]) => <option key={value} value={value}>{config.label}</option>)}
