@@ -5,8 +5,11 @@ Turn a script into a claymation video in 5 steps — fully automated with AI.
 ---
 **##Demo**
 
-https://github.com/user-attachments/assets/91f4d9f0-6c4a-417d-86c2-a7bcd73abaeb
-
+<div style="width: 300px; height: 200px; overflow: hidden; display: inline-block;">
+  <video src="https://github.com/user-attachments/assets/91f4d9f0-6c4a-417d-86c2-a7bcd73abaeb" 
+         style="width: 100%; height: 100%; object-fit: cover;" controls>
+  </video>
+</div>
 
 
 
